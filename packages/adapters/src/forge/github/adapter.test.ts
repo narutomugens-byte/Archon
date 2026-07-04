@@ -1667,5 +1667,63 @@ describe('GitHubAdapter', () => {
       expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
       expect(mockHandleMessage).not.toHaveBeenCalled();
     });
+
+    // --- Hardening: FIX A — idempotency / dedup on PR-open events ---
+    test('FIX-A: duplicate pull_request.opened for same PR on same adapter instance → acquireLock called exactly once', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      // Single adapter instance shares the recentAutoReviews map across both webhook calls.
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      const payload = createPullRequestOpenedPayload({
+        prNumber: 77,
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      // Second dispatch must be deduped — acquireLock called exactly once.
+      expect(mockLockManager.acquireLock).toHaveBeenCalledTimes(1);
+    });
+
+    // --- Hardening: FIX B — reject PR branch name starting with '-' ---
+    test('FIX-B: pull_request.opened with headRef starting with "-" → acquireLock NOT called', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      const payload = createPullRequestOpenedPayload({
+        headRef: '--inject-option',
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
+    });
+
+    // --- Hardening: FIX C — validate configured workflow name ---
+    test('FIX-C: invalid autoReviewWorkflow name (contains spaces/flags) falls back to default "agentic-eval-gate-pr"', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      // An attacker-controlled or misconfigured value with extra tokens must not reach the shell.
+      const adapter = createAutoReviewAdapter({
+        enableAutoReview: true,
+        autoReviewWorkflow: 'evil --no-worktree',
+      });
+      const payload = createPullRequestOpenedPayload({
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).toHaveBeenCalledTimes(1);
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+      const calledMessage = mockHandleMessage.mock.calls[0][2] as string;
+      // Must dispatch the safe default, not the attacker-controlled string.
+      expect(calledMessage).toBe('/workflow run agentic-eval-gate-pr');
+    });
   });
 });

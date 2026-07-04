@@ -53,6 +53,13 @@ const MAX_LENGTH = 65000; // GitHub comment limit (~65,536, leave buffer for saf
 /** Hidden marker added to bot comments to prevent self-triggering loops */
 const BOT_RESPONSE_MARKER = '<!-- archon-bot-response -->';
 
+/** Dedup window for ambient PR auto-review dispatches (ms). */
+const AUTO_REVIEW_DEDUP_WINDOW_MS = 10 * 60_000;
+/** Safe workflow name: only alphanumeric, hyphens, and underscores. */
+const SAFE_WORKFLOW_NAME_RE = /^[A-Za-z0-9_-]+$/;
+/** Default workflow name for auto-review. */
+const DEFAULT_AUTO_REVIEW_WORKFLOW = 'agentic-eval-gate-pr';
+
 export class GitHubAdapter implements IPlatformAdapter {
   /**
    * PAT-mode Octokit: a singleton constructed at startup. Null in App mode —
@@ -84,6 +91,8 @@ export class GitHubAdapter implements IPlatformAdapter {
   private readonly actorByConversation = new Map<string, string>();
   /** userId → short-lived Octokit built from the user's token (amortizes construction). */
   private readonly userOctokitCache = new Map<string, { octokit: Octokit; expiresAt: number }>();
+  /** conversationId → epoch ms of last auto-review dispatch (dedup guard). */
+  private readonly recentAutoReviews = new Map<string, number>();
 
   constructor(
     auth: GitHubAuth,
@@ -114,7 +123,13 @@ export class GitHubAdapter implements IPlatformAdapter {
 
     this.retryDelayFn = options?.retryDelayMs ?? ((attempt: number): number => 1000 * attempt);
     this.enableAutoReview = options?.enableAutoReview ?? false;
-    this.autoReviewWorkflow = options?.autoReviewWorkflow ?? 'agentic-eval-gate-pr';
+    const providedWorkflow = options?.autoReviewWorkflow;
+    if (providedWorkflow !== undefined && !SAFE_WORKFLOW_NAME_RE.test(providedWorkflow)) {
+      getLog().warn({ provided: providedWorkflow }, 'github.auto_review_invalid_workflow');
+      this.autoReviewWorkflow = DEFAULT_AUTO_REVIEW_WORKFLOW;
+    } else {
+      this.autoReviewWorkflow = providedWorkflow ?? DEFAULT_AUTO_REVIEW_WORKFLOW;
+    }
 
     getLog().info(
       { botMention: this.botMention, authMode: auth.kind },
@@ -1301,6 +1316,12 @@ ${userComment}`;
         return;
       }
 
+      // Reject branch names starting with '-' — defense-in-depth against git option injection.
+      if (prBranch.startsWith('-')) {
+        getLog().warn({ conversationId, reason: 'invalid_branch' }, 'github.auto_review_skipped');
+        return;
+      }
+
       if (this.allowedUsers.length === 0) {
         getLog().warn(
           {
@@ -1324,6 +1345,24 @@ ${userComment}`;
         );
         return;
       }
+
+      // Dedup: skip if the same PR was recently dispatched (handles GitHub redeliveries
+      // and close/reopen loops). Prune expired entries first to bound memory.
+      const nowMs = Date.now();
+      for (const [id, ts] of this.recentAutoReviews) {
+        if (nowMs - ts >= AUTO_REVIEW_DEDUP_WINDOW_MS) {
+          this.recentAutoReviews.delete(id);
+        }
+      }
+      const lastDispatched = this.recentAutoReviews.get(conversationId);
+      if (lastDispatched !== undefined && nowMs - lastDispatched < AUTO_REVIEW_DEDUP_WINDOW_MS) {
+        getLog().info(
+          { conversationId, reason: 'recently_dispatched' },
+          'github.auto_review_skipped'
+        );
+        return;
+      }
+      this.recentAutoReviews.set(conversationId, nowMs);
 
       // Resolve or create the Archon user identity for the PR opener.
       let userId: string | undefined;
