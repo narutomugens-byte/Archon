@@ -67,6 +67,8 @@ export class GitHubAdapter implements IPlatformAdapter {
   private botMention: string;
   private lockManager: ConversationLockManager;
   private readonly retryDelayFn: (attempt: number) => number;
+  private readonly enableAutoReview: boolean;
+  private readonly autoReviewWorkflow: string;
   /**
    * Resolve the originating user's personal GitHub token (App mode only).
    * Injected by the server when per-user GitHub is enabled; undefined otherwise.
@@ -91,6 +93,8 @@ export class GitHubAdapter implements IPlatformAdapter {
     options?: {
       retryDelayMs?: (attempt: number) => number;
       getUserToken?: (userId: string) => Promise<string | undefined>;
+      enableAutoReview?: boolean;
+      autoReviewWorkflow?: string;
     }
   ) {
     this.auth = auth;
@@ -109,6 +113,8 @@ export class GitHubAdapter implements IPlatformAdapter {
     }
 
     this.retryDelayFn = options?.retryDelayMs ?? ((attempt: number): number => 1000 * attempt);
+    this.enableAutoReview = options?.enableAutoReview ?? false;
+    this.autoReviewWorkflow = options?.autoReviewWorkflow ?? 'agentic-eval-gate-pr';
 
     getLog().info(
       { botMention: this.botMention, authMode: auth.kind },
@@ -479,17 +485,30 @@ export class GitHubAdapter implements IPlatformAdapter {
    * Does NOT handle:
    * - issues.opened / pull_request.opened → returns null (see #96)
    */
-  private parseEvent(event: WebhookEvent): {
-    owner: string;
-    repo: string;
-    number: number;
-    comment: string;
-    eventType: 'issue' | 'issue_comment' | 'pull_request';
-    issue?: WebhookEvent['issue'];
-    pullRequest?: WebhookEvent['pull_request'];
-    isCloseEvent?: boolean;
-    isMerged?: boolean;
-  } | null {
+  private parseEvent(event: WebhookEvent):
+    | {
+        owner: string;
+        repo: string;
+        number: number;
+        comment: string;
+        eventType: 'issue' | 'issue_comment' | 'pull_request';
+        issue?: WebhookEvent['issue'];
+        pullRequest?: WebhookEvent['pull_request'];
+        isCloseEvent?: boolean;
+        isMerged?: boolean;
+      }
+    | {
+        eventType: 'pull_request_opened';
+        number: number;
+        prBranch: string;
+        prSha: string;
+        isForkPR: boolean;
+        owner: string;
+        repo: string;
+        defaultBranch: string;
+        senderUsername: string;
+      }
+    | null {
     const owner = event.repository.owner.login;
     const repo = event.repository.name;
 
@@ -535,11 +554,23 @@ export class GitHubAdapter implements IPlatformAdapter {
       };
     }
 
-    // Note: We intentionally do NOT handle issues.opened or pull_request.opened
-    // events here. Issue/PR descriptions often contain example commands or
-    // documentation about how to use the bot - these are NOT command invocations.
-    // Only actual comments (issue_comment events) trigger bot responses.
-    // See issue #96 for details.
+    // Handle pull_request.opened for the ambient auto-review path.
+    // @mention descriptions are still NOT handled (see issue #96) — this branch
+    // is auto-review only (never user-initiated), gated by enableAutoReview.
+    if (event.pull_request && event.action === 'opened') {
+      const pr = event.pull_request;
+      return {
+        eventType: 'pull_request_opened',
+        number: pr.number,
+        prBranch: pr.head.ref,
+        prSha: pr.head.sha,
+        isForkPR: pr.head.repo?.full_name !== event.repository.full_name,
+        owner,
+        repo,
+        defaultBranch: event.repository.default_branch,
+        senderUsername: event.sender.login,
+      };
+    }
 
     return null;
   }
@@ -944,6 +975,11 @@ ${userComment}`;
     const parsed = this.parseEvent(event);
     if (!parsed) return;
 
+    if (parsed.eventType === 'pull_request_opened') {
+      await this.handleAutoReview(parsed);
+      return;
+    }
+
     const { owner, repo, number, comment, eventType, issue, pullRequest, isCloseEvent, isMerged } =
       parsed;
 
@@ -1225,5 +1261,138 @@ ${userComment}`;
         }
       }
     });
+  }
+
+  /**
+   * Dispatch the ambient PR-review workflow when a pull_request.opened event arrives.
+   * Read-only gate — never modifies the PR branch. Fail-soft: one bad PR must
+   * never throw out of the webhook handler.
+   *
+   * Preconditions:
+   * - MUST only be called after handleWebhook has verified the HMAC signature.
+   * - Intentionally fail-closed: default-off, skips fork PRs, and requires a
+   *   non-empty GITHUB_ALLOWED_USERS to prevent unbounded AI cost from arbitrary
+   *   senders.
+   */
+  private async handleAutoReview(parsed: {
+    eventType: 'pull_request_opened';
+    number: number;
+    prBranch: string;
+    prSha: string;
+    isForkPR: boolean;
+    owner: string;
+    repo: string;
+    defaultBranch: string;
+    senderUsername: string;
+  }): Promise<void> {
+    const { number, prBranch, prSha, isForkPR, owner, repo, defaultBranch, senderUsername } =
+      parsed;
+    const conversationId = this.buildConversationId(owner, repo, number);
+
+    try {
+      if (!this.enableAutoReview) {
+        getLog().info({ conversationId, reason: 'disabled' }, 'github.auto_review_skipped');
+        return;
+      }
+
+      if (isForkPR) {
+        // Never run repo scripts on untrusted fork code.
+        getLog().info({ conversationId, reason: 'fork_pr' }, 'github.auto_review_skipped');
+        return;
+      }
+
+      if (this.allowedUsers.length === 0) {
+        getLog().warn(
+          {
+            conversationId,
+            reason: 'no_allowlist',
+            message: 'Set GITHUB_ALLOWED_USERS to enable auto-review',
+          },
+          'github.auto_review_skipped'
+        );
+        return;
+      }
+
+      if (!isGitHubUserAuthorized(senderUsername, this.allowedUsers)) {
+        getLog().info(
+          {
+            conversationId,
+            reason: 'unauthorized',
+            maskedUser: senderUsername.slice(0, 3) + '***',
+          },
+          'github.auto_review_skipped'
+        );
+        return;
+      }
+
+      // Resolve or create the Archon user identity for the PR opener.
+      let userId: string | undefined;
+      try {
+        const user = await userDb.findOrCreateUserByPlatformIdentity(
+          'github',
+          senderUsername,
+          senderUsername
+        );
+        userId = user.id;
+      } catch (err) {
+        getLog().warn(
+          { err: toError(err), githubLogin: senderUsername },
+          'github.auto_review_user_resolve_failed'
+        );
+      }
+
+      // Ensure a conversation row exists and is linked to the codebase.
+      const existingConv = await db.getOrCreateConversation('github', conversationId);
+      const isNewConversation = !existingConv.codebase_id;
+      const {
+        codebase,
+        repoPath,
+        isNew: isNewCodebase,
+      } = await this.getOrCreateCodebaseForRepo(owner, repo);
+
+      // Ensure the repo is cloned (and synced if it's a new codebase) before the
+      // workflow runs. Without this, isolation fails with "not a valid git repository".
+      await this.ensureRepoReady(owner, repo, defaultBranch, repoPath, isNewCodebase);
+
+      if (isNewConversation) {
+        try {
+          await db.updateConversation(existingConv.id, {
+            codebase_id: codebase.id,
+            cwd: repoPath,
+          });
+        } catch (updateError) {
+          if (updateError instanceof ConversationNotFoundError) {
+            getLog().error(
+              { conversationId: existingConv.id, codebaseId: codebase.id },
+              'github.auto_review_conversation_link_failed'
+            );
+            throw new Error('Failed to set up GitHub conversation for auto-review');
+          }
+          throw updateError;
+        }
+      }
+
+      // Build isolation hints — same shape as the @mention PR path.
+      const isolationHints: IsolationHints = {
+        workflowType: 'pr',
+        workflowId: String(number),
+        prBranch: toBranchName(prBranch),
+        prSha,
+        isForkPR: false,
+      };
+
+      const message = `/workflow run ${this.autoReviewWorkflow}`;
+
+      getLog().info(
+        { conversationId, workflow: this.autoReviewWorkflow },
+        'github.auto_review_started'
+      );
+
+      await this.lockManager.acquireLock(conversationId, () =>
+        handleMessage(this, conversationId, message, { isolationHints, userId })
+      );
+    } catch (err) {
+      getLog().error({ err: toError(err), conversationId }, 'github.auto_review_failed');
+    }
   }
 }

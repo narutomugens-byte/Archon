@@ -19,6 +19,8 @@ export interface WebhookEvent {
     changed_files?: number;
     additions?: number;
     deletions?: number;
+    head: { ref: string; sha: string; repo: { full_name: string } | null };
+    base: { ref: string };
   };
   comment?: {
     body: string;
