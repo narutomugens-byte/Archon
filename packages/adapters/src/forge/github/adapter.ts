@@ -1431,7 +1431,30 @@ ${userComment}`;
         handleMessage(this, conversationId, message, { isolationHints, userId })
       );
     } catch (err) {
-      getLog().error({ err: toError(err), conversationId }, 'github.auto_review_failed');
+      const error = toError(err);
+      getLog().error({ err: error, conversationId }, 'github.auto_review_failed');
+      // Loud-fail: auto-review passed its skip-gates (enabled + authorized +
+      // non-fork + not-deduped) but then broke — a missing/unloadable workflow,
+      // a dead credential, or a clone/DB/runtime failure. An absent verdict is
+      // indistinguishable from a passing one, so this MUST NOT fail silently.
+      // Post a framed comment so the trap is visible on the PR itself rather
+      // than buried in a log line on an unwatched webhook box.
+      try {
+        const detail = classifyAndFormatError(error);
+        await this.sendMessage(
+          conversationId,
+          '## 🤖 Archon PR Review — could not run\n\n' +
+            'Automated review was triggered for this PR but failed before producing a verdict. ' +
+            '**This is a configuration or runtime error, NOT a passing review** — the PR has not been evaluated.\n\n' +
+            `**Reason:** ${detail}\n\n` +
+            `---\n_Automated read-only review. Re-open the PR (or re-run \`${this.autoReviewWorkflow}\`) once the issue is resolved._`
+        );
+      } catch (sendError) {
+        getLog().error(
+          { err: toError(sendError), conversationId },
+          'github.auto_review_failnotice_send_failed'
+        );
+      }
     }
   }
 }

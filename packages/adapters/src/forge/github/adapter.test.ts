@@ -1725,5 +1725,38 @@ describe('GitHubAdapter', () => {
       // Must dispatch the safe default, not the attacker-controlled string.
       expect(calledMessage).toBe('/workflow run agentic-eval-gate-pr');
     });
+
+    // --- Loud-fail: a dispatch that breaks AFTER the skip-gates must never be silent ---
+    test('LOUD-FAIL: dispatch throws after passing gates → posts a framed "could not run" comment (not silent, not a pass)', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      const mockCreateComment = mock(() => Promise.resolve({ data: {} }));
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      // Inject a mocked Octokit so the loud-fail comment can be asserted.
+      // @ts-expect-error - accessing private property for testing
+      adapter.octokit = { rest: { issues: { createComment: mockCreateComment } } };
+      // A missing/unloadable workflow, dead credential, or runtime failure all
+      // surface as a throw out of handleMessage — simulate that here.
+      mockHandleMessage.mockRejectedValueOnce(
+        new Error('Workflow `agentic-eval-gate-pr` not found')
+      );
+
+      const payload = createPullRequestOpenedPayload({
+        prNumber: 42,
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      // The failure must NOT be silent — exactly one framed comment is posted.
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+      expect(mockCreateComment).toHaveBeenCalledTimes(1);
+      const body = mockCreateComment.mock.calls[0][0].body as string;
+      expect(body).toContain('could not run');
+      expect(body).toContain('NOT a passing review');
+      // And it must surface the underlying reason for the operator.
+      expect(body).toContain('not found');
+    });
   });
 });
