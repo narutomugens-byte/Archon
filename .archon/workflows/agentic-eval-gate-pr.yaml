@@ -144,14 +144,41 @@ nodes:
         have() { grep -q "\"$1\"" package.json; }
         runner=npm; command -v bun >/dev/null 2>&1 && runner=bun
 
+        # Detect whether this review sandbox actually has installed dependencies.
+        # Archon isolates a PR in a fresh worktree that copies only `.archon` — it
+        # never installs node_modules. A type-check/lint that needs local tooling
+        # (tsc, eslint, workspace symlinks, @types) then fails for ENVIRONMENT
+        # reasons, not because the PR's code is wrong (confirmed: a bare Archon
+        # worktree fails type-check with "command not found: tsc" and lint with
+        # "Cannot find package '@eslint/js'"). Reporting that as `fail` would
+        # spuriously block EVERY good PR. So: run the check, but if it fails AND
+        # deps are absent, downgrade the result to `unavailable-no-deps`
+        # (UNVERIFIED) instead of `fail`. A dep-free check that passes still
+        # reports `pass`, so no real signal is lost.
+        DEPS=absent; [ -d node_modules ] && DEPS=present
+
         if have 'type-check'; then
           echo "=== type-check ==="
-          if $runner run type-check >/tmp/tc.log 2>&1; then TYPECHECK=pass; else TYPECHECK=fail; fi
+          if $runner run type-check >/tmp/tc.log 2>&1; then
+            TYPECHECK=pass
+          elif [ "$DEPS" = absent ]; then
+            TYPECHECK=unavailable-no-deps
+            echo "(type-check FAILED but node_modules is absent in this review worktree — the failure is missing tooling/deps, not the PR. Reporting UNVERIFIED, not fail.)"
+          else
+            TYPECHECK=fail
+          fi
           tail -30 /tmp/tc.log
         fi
         if have 'lint'; then
           echo "=== lint ==="
-          if $runner run lint >/tmp/lint.log 2>&1; then LINT=pass; else LINT=fail; fi
+          if $runner run lint >/tmp/lint.log 2>&1; then
+            LINT=pass
+          elif [ "$DEPS" = absent ]; then
+            LINT=unavailable-no-deps
+            echo "(lint FAILED but node_modules is absent — reporting UNVERIFIED, not fail.)"
+          else
+            LINT=fail
+          fi
           tail -30 /tmp/lint.log
         fi
         echo "NOTE: full test/validate suite intentionally NOT run by this gate (speed + root-test safety). The trajectory eval must treat test coverage as UNVERIFIED unless the diff itself adds/updates tests."
@@ -240,7 +267,21 @@ nodes:
       ## What to flag as a skipped/unsound step
       - New or changed behavior with NO added/updated tests (the gate did not run
         the suite — so absence of test changes in the diff = UNVERIFIED, flag it).
-      - type-check or lint reported "fail" above.
+      - type-check or lint reported "fail" above (deps were installed and the
+        check actually ran — a genuine failure). NOTE: the status
+        "unavailable-no-deps" is NOT a failure and NOT a hollow check — it means a
+        REAL check could not execute because the review sandbox had no installed
+        dependencies; weigh it exactly like the untested-suite case above
+        (UNVERIFIED). Every other soundness rule here still applies in full.
+      - HOLLOW / STUBBED checks: a reported "pass" is only meaningful if the check
+        actually verifies something. Open package.json and inspect the
+        `type-check`, `lint`, and `test` scripts. If any is a no-op or stub —
+        `echo ...`, `true`, `exit 0`, `:`, an empty command, or anything that does
+        not invoke a real checker (tsc, eslint, a genuine test runner / script) —
+        then its "pass" is FAKE. Treat a passing-but-hollow check as UNVERIFIED,
+        and flag the stubbed check itself as an unsound, misleading step. This is
+        the canonical "skipped while still looking correct" case this eval exists
+        to catch — do not take a green check on trust without confirming it is real.
       - New error paths swallowed, or new external input unvalidated.
       - Security-sensitive surface (auth, file paths, secrets, shell, SQL) touched
         without a corresponding guard.
