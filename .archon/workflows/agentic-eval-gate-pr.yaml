@@ -265,8 +265,12 @@ nodes:
       $run-checks.output
 
       ## What to flag as a skipped/unsound step
-      - New or changed behavior with NO added/updated tests (the gate did not run
-        the suite — so absence of test changes in the diff = UNVERIFIED, flag it).
+      - New or changed behavior with NO added/updated tests IN THE DIFF — flag it.
+        IMPORTANT: the gate does NOT execute the test suite by design, so do NOT
+        treat "the tests weren't run" as a defect. Tests PRESENT in the diff that
+        cover the changed behavior SATISFY the coverage requirement — judge them by
+        READING them, not by whether they executed. Only genuinely ABSENT tests for
+        changed behavior are a flag here.
       - type-check or lint reported "fail" above (deps were installed and the
         check actually ran — a genuine failure). NOTE: the status
         "unavailable-no-deps" is NOT a failure and NOT a hollow check — it means a
@@ -286,6 +290,16 @@ nodes:
       - Security-sensitive surface (auth, file paths, secrets, shell, SQL) touched
         without a corresponding guard.
       List every skipped/unsound step concretely with file:line where relevant.
+
+      ## How to conclude soundness
+      Conclude "sound" when the change is correct AND its behavior is covered by
+      tests present in the diff AND none of the flags above genuinely apply.
+      Checks reported "unavailable-no-deps" (a real check the sandbox could not
+      run) and the gate's by-design non-execution of the test suite are NOT, by
+      themselves, grounds for "unsound" — a clean, well-tested diff is SOUND even
+      when the sandbox could not execute its tooling. Reserve "unsound" for genuine
+      gaps: ABSENT tests for changed behavior, a real check FAILURE (deps present),
+      stubbed/hollow checks, swallowed errors, or an unguarded security surface.
     output_format:
       type: object
       properties:
@@ -301,22 +315,40 @@ nodes:
         summary: { type: string }
       required: [soundness, summary]
 
-  # ─── 5. VERDICT (cheap synthesis = the gate; emits a Markdown PR comment) ──
-  - id: verdict
+  # ─── 5. GATE DECISION (deterministic — NOT delegated to an LLM) ───────────
+  # PASS iff output-eval verdict == "pass" AND trajectory soundness == "sound".
+  # A small model re-deriving this boolean from prose was observed to flip a
+  # legitimate PASS to FAIL, so the decision is computed here in bash; the verdict
+  # node only writes the comment for the decision it is handed. printf (no newline)
+  # so the value substitutes cleanly into the Markdown header.
+  - id: gate-decision
     depends_on: [output-eval, trajectory-eval]
+    bash: |
+      # Archon already shell-quotes each `$node.output.field` substitution, so the
+      # tokens are assigned WITHOUT surrounding quotes (double-quoting a pre-quoted
+      # value yields the literal wrong string). Our own $V/$S are quoted normally.
+      V=$output-eval.output.verdict
+      S=$trajectory-eval.output.soundness
+      if [ "$V" = "pass" ] && [ "$S" = "sound" ]; then
+        printf 'PASS'
+      else
+        printf 'FAIL'
+      fi
+
+  # ─── 6. VERDICT (writes the Markdown PR comment for the computed decision) ──
+  - id: verdict
+    depends_on: [gate-decision, output-eval, trajectory-eval]
     model: small
     context: fresh
     allowed_tools: []
     prompt: |
-      You are the gate. Combine the two evaluations into ONE decision and write a
-      concise Markdown PR-review comment (this text is posted verbatim as a GitHub
-      PR comment).
+      You write the PR-review comment (posted verbatim as a GitHub PR comment).
+      You do NOT decide PASS/FAIL — the gate decision was already computed
+      deterministically upstream and is handed to you below. Use it VERBATIM in the
+      header, and write prose that is consistent with it (do not argue for a
+      different outcome).
 
-      Rule: gate = PASS only if BOTH hold:
-        - output eval verdict is "pass"  (NOT partial, NOT fail), AND
-        - trajectory eval soundness is "sound".
-      Otherwise gate = FAIL. "set the bar at the eval, not the demo" — when
-      uncertain, FAIL and say what evidence is missing.
+      GATE DECISION (authoritative, computed upstream): $gate-decision.output
 
       GROUNDING CONSTRAINT (critical): ANY file paths, symbol names, or line
       references you mention MUST be taken verbatim from the `output-eval` and
@@ -335,9 +367,10 @@ nodes:
       $trajectory-eval.output.summary
 
       Write the comment in EXACTLY this Markdown shape (fill the angle-bracket
-      slots; drop the "Blocking reasons" section entirely when the gate is PASS):
+      slots; include the "Blocking reasons" section ONLY when the decision is FAIL,
+      drop it entirely when PASS):
 
-      ## 🤖 Archon PR Review — Gate: <PASS or FAIL>
+      ## 🤖 Archon PR Review — Gate: $gate-decision.output
 
       <one or two sentence overall rationale, grounded in the findings above>
 
