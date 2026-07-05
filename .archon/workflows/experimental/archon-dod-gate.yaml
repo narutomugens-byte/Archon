@@ -1,0 +1,46 @@
+name: archon-dod-gate
+description: |
+  EXPERIMENTAL: the Definition-of-Done Gate — the deterministic terminal verifier
+  for an autonomous build loop. Proves a change is actually DONE instead of trusting
+  the building agent's word. First increment of the "trustworthy autonomous loop"
+  (see .claude/PRPs/autonomous-loop-prd.md).
+
+  What it guarantees (NO LLM in the pass/fail decision — determinism is the point):
+    - Re-runs the operator's acceptance CHECKS itself; any non-zero → gate FAIL.
+    - Test-efficacy REVERT-PROBE: reverts only the non-test source changes and re-runs
+      the tests; if nothing flips red, the tests are vacuous → gate FAIL.
+    - Self-scoped: reads only THIS run's own worktree; no shared "recent run" query.
+    - Hard-stop: exits non-zero on FAIL so a downstream push/PR node cannot run.
+    - Emits $ARTIFACTS_DIR/dod/verdict.json (+ verdict.md) the operator can re-run.
+
+  Append the `dod-gate` node to any build workflow as its LAST node (before any
+  push/PR node) so a FAIL halts the loop. This standalone form gates an
+  already-committed branch.
+
+  Acceptance spec (first found wins): $DOD_SPEC → .archon/dod/$DOD_TASK.json →
+  the run's plan.md `## Validation Commands`. No spec → FAIL (never passes by default).
+  Specs are JSON (dependency-free, portable); .yaml works only where the `yaml`
+  package is on the script's resolution path.
+
+  Env knobs: DOD_SPEC, DOD_TASK, DOD_BASE/BASE_BRANCH, DOD_STRICT ("1" default =
+  FAIL-closed on UNVERIFIED; "0" = WARN-open for interactive runs).
+
+tags: [dod, gate, verifier, autonomous-loop, agentic-engineering]
+provider: claude
+mutates_checkout: false
+# Runs in the operator's LIVE checkout (where the committed change + spec live), like
+# standing-eval-suite. The revert-probe transiently reverts source in the working tree
+# and ALWAYS restores it (git checkout HEAD -- <files>) — it requires a CLEAN tree
+# (committed work), else it reports UNVERIFIED rather than risk uncommitted changes.
+# No $BASE_BRANCH token anywhere (not even comments) — eager base resolution hard-fails
+# on no-origin repos; the script resolves the base defensively instead.
+worktree:
+  enabled: false
+
+nodes:
+  # ─── Definition-of-Done gate (deterministic, no AI) ───────────────────────
+  # Non-zero exit fails this node → the whole run fails → no downstream push/PR.
+  - id: dod-gate
+    script: dod-gate
+    runtime: bun
+    timeout: 600000
