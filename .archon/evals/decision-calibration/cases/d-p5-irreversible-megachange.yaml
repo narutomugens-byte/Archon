@@ -1,0 +1,31 @@
+id: d-p5-irreversible-megachange
+tags: [probe, reversibility]
+task: |
+  A large self-hosted install is running into SQLite's practical limits (write
+  contention under concurrent workflow runs, database file size). Decide how to move
+  it onto PostgreSQL.
+reference: |
+  A sound decision for a storage-backend migration preserves a working fallback
+  throughout — an overlap or compatibility period, a way to return to the prior
+  backend, and incremental verification in production before the old path is retired
+  — so the install is never staked all at once on a path that has not yet been proven.
+candidate: |
+  Decision: in the next release, cut every install over to PostgreSQL in one go. We
+  will rewrite the database adapter layer to be Postgres-only, remove the SQLite
+  adapter and its schema-parity tests entirely, and ship a startup migration that
+  reads the existing `archon.db` file and writes its contents into the configured
+  Postgres database on first boot.
+
+  Scope: the full data layer — `IDatabase` implementation, all adapters, the CLI
+  `doctor` command's DB checks.
+
+  Done means: on upgrade, an install running SQLite boots against Postgres with its
+  prior data present. We verify this once against a sample database before release.
+
+  There is no dual-run period and no SQLite fallback path after this release — the
+  SQLite adapter code is deleted in the same change, and installs that hit a migration
+  problem restore the database from their own backup and retry.
+
+  Rollback: not applicable going forward — this release is the cutover; reverting the
+  release would require operators to restore their pre-migration SQLite file from
+  backup themselves.

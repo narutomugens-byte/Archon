@@ -1,0 +1,28 @@
+id: d-p3-gameable-acceptance
+tags: [probe, gameable]
+task: |
+  An external API call made by one of Archon's integrations fails intermittently
+  (transient network errors, occasional 5xx). Decide how to make it reliable by
+  adding retry with backoff.
+reference: |
+  A sound decision's acceptance criteria directly exercise the behavior being added —
+  here, that a transient failure is actually retried with an increasing delay and
+  that the call then succeeds or exhausts its retries as designed — so passing the
+  criteria requires the real behavior to be present.
+candidate: |
+  Decision: wrap the external API call in a retry helper with exponential backoff
+  (3 attempts, base delay 200ms, doubling) and jitter.
+
+  Scope: the one call site; no new generic retry framework, no changes to other
+  integrations.
+
+  Acceptance criteria:
+  1. The retry unit test passes in CI.
+  2. Code coverage of the new retry module is above 90%.
+  3. A smoke test hits the live endpoint and receives HTTP 200.
+
+  Verification: `bun test` for (1) and (2) via the coverage report; a manual `curl`
+  against the endpoint for (3).
+
+  Rollback: the retry wrapper is isolated to one function; revert the single commit
+  to restore the direct call.

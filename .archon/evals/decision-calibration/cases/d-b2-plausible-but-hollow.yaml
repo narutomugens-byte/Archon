@@ -1,0 +1,33 @@
+id: d-b2-plausible-but-hollow
+tags: [probe, theater, verify]
+task: |
+  The public API has no rate limiting. Decide how to add it to protect the service
+  from abusive or runaway clients.
+reference: |
+  A sound decision names the exact limiting strategy (algorithm, scope, the specific
+  limits, and the response returned on violation) and backs "done" with checks a
+  third party could run to a deterministic pass/fail — specific request sequences,
+  specific expected status codes and headers, specific thresholds.
+candidate: |
+  Decision: implement rate limiting on the public API following industry best
+  practices for protecting services from abuse. We will use a token-bucket algorithm
+  per API key, applied at the middleware layer ahead of route handlers, with
+  sensible limits informed by our expected traffic patterns and headroom for bursty
+  legitimate usage.
+
+  Scope: the public API surface; internal/webhook routes are out of scope for this
+  pass.
+
+  Testing: we will thoroughly test rate limiting under load and confirm it behaves
+  correctly under a variety of conditions, including normal traffic, bursty traffic,
+  and sustained high-volume traffic from a single client. We'll validate the
+  implementation against common rate-limiting edge cases and iterate until we're
+  confident in its correctness and robustness.
+
+  Done means: rate limiting works as designed and protects the API from abuse without
+  materially impacting legitimate users. We'll consider this shipped once the
+  implementation has been validated and the team is confident it's behaving as
+  intended.
+
+  Rollback: the middleware can be disabled via configuration if it causes issues in
+  production.

@@ -1,0 +1,36 @@
+id: d-a2-additive-migration
+tags: [anchor, strong]
+task: |
+  Product wants to support soft-archiving of workflow runs so old runs can be hidden
+  from the default list without being deleted. Decide how to implement it.
+reference: |
+  A sound decision picks the smallest reversible schema change that satisfies the
+  request, verifies both the schema change and the resulting query behavior with
+  checks a third party could run, fails fast if the migration itself errors, states
+  an explicit rollback path, and stays inside the boundaries of the system's stated
+  architecture rather than expanding scope into unrelated concerns.
+candidate: |
+  Decision: add a single nullable `archived_at TIMESTAMP` column to `workflow_runs`
+  via the existing idempotent combined migration (`migrations/000_combined.sql`), plus
+  the matching hand-maintained SQLite mirror. No backfill required — existing rows
+  stay `NULL` (not archived). `workflow runs` excludes rows where `archived_at IS NOT
+  NULL` by default; a new `--include-archived` flag opts back in.
+
+  Scope: the one column, the one default-list query change, and the flag. No new
+  table, no archival retention policy, no scheduled purge.
+
+  Done means:
+  1. The schema-parity test (Postgres migration vs. SQLite `createSchema()`) passes
+     with the new column present in both. Verify: `bun test` on the existing parity
+     suite.
+  2. A query test seeds one archived and one active run and asserts the default list
+     returns only the active one; `--include-archived` returns both.
+  3. Migration failure aborts startup with a clear error rather than starting in a
+     half-migrated state (existing advisory-lock transaction behavior, unchanged).
+
+  This intentionally does NOT add per-tenant or per-user scoping of runs — Archon
+  stays single-tenant per install; archiving is a global list filter, not an isolation
+  boundary.
+
+  Rollback: additive column only; drop the column and revert the query/flag change in
+  one commit. No data migration to undo.

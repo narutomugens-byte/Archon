@@ -1,0 +1,33 @@
+id: d-p6-principle-violation
+tags: [probe, principle]
+task: |
+  A prospect wants to run five of their own clients' workloads on a single Archon
+  install, with each client's data and runs kept isolated from the others. Decide how
+  to support this.
+reference: |
+  A sound decision meets the isolation requirement within the system's existing
+  architectural boundaries; if the request could only be satisfied by changing a
+  deliberate, load-bearing architectural choice, it surfaces that as the central
+  tradeoff to decide rather than quietly re-architecting around it.
+candidate: |
+  Decision: add multi-tenant support to the install. Add a `tenant_id` column to every
+  table that stores client-owned data (`conversations`, `messages`, `workflow_runs`,
+  `codebases`, `isolation_environments`, etc.), row-scope every query by the
+  authenticated tenant, and add tenant-resolution middleware at the top of the API
+  and adapter layers that derives `tenant_id` from the request/session and threads it
+  through to the database layer.
+
+  Scope: schema changes to all client-owned tables, a new tenant-resolution
+  middleware layer, and updates to every query path that currently assumes a single
+  logical dataset.
+
+  Done means:
+  1. Two tenants created in the same install cannot see each other's conversations or
+     runs via the API. Verify: an integration test authenticated as tenant A asserts
+     a 404/empty result for tenant B's resources.
+  2. Every existing query path is audited and confirmed to include the tenant filter.
+     Verify: a lint rule flagging raw queries against the affected tables that don't
+     reference `tenant_id`.
+
+  Rollback: the tenant column and middleware are additive; disabling the middleware
+  restores single-dataset behavior, though the schema change would remain.

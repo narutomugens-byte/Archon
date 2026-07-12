@@ -1,0 +1,33 @@
+id: d-p1-scope-creep
+tags: [probe, scope]
+task: |
+  A bug report: `archon workflow list` throws and returns nothing when a single
+  workflow YAML file in `.archon/workflows/` is malformed — one bad file aborts
+  discovery of every other workflow in the repo. Decide how to fix it.
+reference: |
+  A sound decision fixes the reported defect with the smallest change that traces
+  directly to it, states explicit non-goals for anything adjacent it is choosing NOT
+  to touch, defines done with checks a third party could run against the specific
+  failure mode, and keeps the change small enough to review and revert on its own.
+candidate: |
+  Decision: fix the crash — wrap per-file parsing in `discoverWorkflows()` in a
+  try/catch so one malformed YAML is skipped and reported as an error entry instead
+  of aborting the whole scan, matching how `/workflow list` already surfaces
+  per-workflow errors.
+
+  While we're in there, this is also the right moment to modernize workflow discovery
+  more broadly: introduce a plugin architecture so third parties can register custom
+  node types, add an in-memory caching layer in front of discovery so repeated CLI
+  calls don't re-read the filesystem, design a new declarative validation DSL to
+  replace the current Zod schema checks, and migrate all existing bundled and
+  project workflows to a new v2 schema version to take advantage of it. Bundling all
+  of this into one release means operators only have to absorb one migration instead
+  of several over time.
+
+  Done means: `archon workflow list` no longer throws on a malformed file, the new
+  plugin system loads at least one sample third-party node type, the cache
+  demonstrably speeds up a repeated `list` call, and all bundled workflows validate
+  against the new v2 schema.
+
+  Rollback: revert the release; the v2 schema migration and plugin loader would need
+  to be unwound together since workflows will have been rewritten to the new format.

@@ -1,0 +1,25 @@
+id: d-p2-unverifiable-done
+tags: [probe, verify]
+task: |
+  Users report that streaming AI responses over SSE in the web UI feels laggy —
+  characters appear to arrive in bursts rather than smoothly. Decide how to reduce
+  perceived latency in the streaming path.
+reference: |
+  A sound decision names the specific mechanism it will change and states a
+  measurable before/after signal (a timing, a chunk size, a rendered-frame count)
+  together with how that signal is captured, so "done" is a check a third party could
+  run and reproduce.
+candidate: |
+  Decision: optimize the SSE streaming path in the web adapter so responses feel
+  snappier. We'll look at the chunking logic, the flush behavior, and the client-side
+  rendering loop, and make targeted improvements wherever we find the biggest wins.
+
+  Scope: the streaming path between the AI provider and the browser; no protocol
+  change (still SSE, not WebSockets).
+
+  Done means: streaming feels snappy and responsive. We'll know it's better when it
+  feels better during manual testing — a few team members will use the chat UI for a
+  while and share whether it feels improved. If the team is generally happy with how
+  it feels, we ship it.
+
+  Rollback: revert the commit if streaming feels worse afterward.

@@ -1,0 +1,28 @@
+id: d-p4-wrong-problem
+tags: [probe, problem-fit]
+task: |
+  Web-UI users report: "my chat history disappears after I refresh the page."
+  Decide how to fix it.
+reference: |
+  A sound decision for a reported symptom first establishes its actual cause, then
+  commits to a fix whose "done" criteria hold across the range of conditions the
+  report implies (an ordinary refresh, a fresh session, a different device), not only
+  the easiest case to demonstrate.
+candidate: |
+  Decision: add a client-side IndexedDB cache of chat messages in the web UI. On
+  load, the chat view will hydrate instantly from the local cache instead of waiting
+  on a network round-trip, and messages will be written to the cache as they stream
+  in. This eliminates the visible "history disappears" flash on refresh.
+
+  Scope: the web UI message store only; no changes to the conversations or messages
+  API routes.
+
+  Done means:
+  1. Refreshing the page re-renders the full visible conversation from IndexedDB with
+     no network wait. Verify: a browser test that reloads the page and asserts prior
+     messages render before the `/api/conversations/:id/messages` fetch resolves.
+  2. Cache writes happen on every streamed chunk, keyed by conversation id. Verify: a
+     unit test on the store's write path.
+
+  Rollback: the cache layer is additive and can be disabled by a feature flag,
+  falling back to the existing network-only load.

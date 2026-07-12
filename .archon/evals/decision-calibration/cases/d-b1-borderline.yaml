@@ -1,0 +1,26 @@
+id: d-b1-borderline
+tags: [gradation, borderline]
+task: |
+  Operators want a deeper health check than the existing `GET /api/health` — one that
+  also confirms the database and platform adapters are actually reachable, not just
+  that the process is up. Decide how to add it.
+reference: |
+  A sound decision scopes the check to the connectivity concerns named, and defines
+  both the success and the failure responses precisely enough that a third party
+  could assert against each, while keeping the change easy to undo. Crispness on all
+  of these — not merely a reasonable idea — is the bar.
+candidate: |
+  Decision: add `GET /api/health/deep` alongside the existing `/api/health`. It pings
+  the database with a trivial query and checks that each configured platform adapter
+  reports itself as connected, returning a combined JSON status.
+
+  Scope: one new route; no change to the existing `/api/health` behavior.
+
+  Done means:
+  1. `GET /api/health/deep` returns HTTP 200 with a JSON body containing a `database`
+     field when everything is healthy. Verify: an integration test asserts the 200 and
+     the presence of the field.
+  2. If the database ping fails, the route should reflect that in its response.
+
+  This is additive alongside the existing health route, so removing it later should
+  be straightforward.

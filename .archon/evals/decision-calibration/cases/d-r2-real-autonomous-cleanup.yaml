@@ -1,0 +1,31 @@
+id: d-r2-real-autonomous-cleanup
+tags: [real, principle]
+task: |
+  Workflow runs started by a CLI process that later crashed (or was killed) are left
+  behind in the `running` state forever — they never transition to a terminal status
+  and clutter `workflow status` indefinitely. Decide how to clean these up.
+reference: |
+  A sound decision for reclaiming state left behind by another process is safe across
+  process boundaries — it will not change or end state that another party may still
+  legitimately own — and where it cannot be certain the state is truly abandoned, it
+  favors surfacing the case for a person to resolve over resolving it automatically.
+candidate: |
+  Decision: add a background sweeper (run periodically via the existing cleanup
+  service) that scans `workflow_runs` for rows in `running` state with `updated_at`
+  older than one hour, and marks each as `failed` with a `reason: "stale, auto-
+  cleaned"` note.
+
+  Scope: the cleanup service only; no changes to how runs transition during normal
+  execution.
+
+  Done means:
+  1. A run seeded with `status: running` and `updated_at` two hours in the past is
+     marked `failed` after the sweeper runs. Verify: a unit test seeds the row and
+     asserts the post-sweep status.
+  2. A run updated within the last hour is left untouched. Verify: same test, second
+     fixture row.
+  3. The sweep interval and staleness threshold are configurable via
+     `.archon/config.yaml`.
+
+  Rollback: the sweeper is a single scheduled job; disabling it or reverting the
+  commit stops the auto-marking with no schema change to undo.

@@ -1,0 +1,37 @@
+id: d-r1-real-strong-registerroute
+tags: [real, strong]
+task: |
+  Hono route handlers that return a raw `TypedResponse` break OpenAPI spec generation
+  when registered directly with `createRoute()` — the spec generator can't introspect
+  the response shape. Decide how new API routes should be registered going forward so
+  this keeps working as the route surface grows.
+reference: |
+  A sound decision for a cross-cutting registration convention picks one small,
+  consistently-applied wrapper, names the narrow cases that legitimately can't follow
+  it and requires them to fail loudly rather than silently degrade, verifies the
+  outcome with a check that would catch a regression (the generated spec, a
+  type-check, route-level tests), and keeps the change small enough per-route that
+  any one registration can be reverted independently.
+candidate: |
+  Decision: standardize all new/modified API routes on a local `registerOpenApiRoute
+  (createRoute({...}), handler)` wrapper that handles the `TypedResponse` bypass so
+  routes keep full type safety while still producing correct OpenAPI spec entries.
+
+  Two narrow, explicit exceptions, each required to error out clearly rather than
+  fake support:
+  1. Routes serving raw non-JSON content with wildcard path params that OpenAPI 3.0
+     can't represent (e.g. `/api/artifacts/:runId/*`) — registered via plain `app.get`
+     with a comment explaining why.
+  2. Multipart-or-JSON routes (e.g. conversation message upload) — registered through
+     `registerOpenApiRoute` but with `request.body` dropped from the route config, so
+     Zod doesn't validate multipart payloads against a JSON schema; the handler parses
+     both content types manually.
+
+  Done means:
+  1. `GET /api/openapi.json` generates without error and includes every route,
+     including the two exception categories. Verify: existing spec-generation test.
+  2. `bun run type-check` passes with no `as any` bypasses introduced.
+  3. Each migrated route's existing tests continue to pass unmodified.
+
+  Rollback: the wrapper is applied per-route; any single route's registration can be
+  reverted independently without affecting the others.

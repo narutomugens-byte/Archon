@@ -1,0 +1,33 @@
+id: d-a1-scoped-cli-flag
+tags: [anchor, strong]
+task: |
+  Operators running many workflows say `archon workflow runs` prints too much history
+  to scan at a glance and they only care about recent activity. Decide how to let them
+  filter the list by recency.
+reference: |
+  A sound decision scopes to exactly the filtering need described, commits only to
+  changes that trace to it, defines "done" with objective checks a third party could
+  run (including the bad-input case), keeps the change small and revertible, and
+  avoids pulling in new dependencies or abstractions the request doesn't call for.
+candidate: |
+  Decision: add a `--since <duration>` flag to `archon workflow runs` (e.g. `--since 2h`,
+  `--since 3d`) that filters the existing query to rows created after `now - duration`.
+  Duration parsing uses a small hand-written parser (unit suffixes h/d/w) — no new
+  date-library dependency.
+
+  Scope (non-goals stated explicitly): ONLY `workflow runs`. NOT `workflow list`,
+  `workflow status`, or `workflow get` — none of them print a time-ordered list, so
+  `--since` doesn't apply. No new sort order, no new output columns.
+
+  Done means:
+  1. `archon workflow runs --since 2h` returns only rows with `created_at` after the
+     cutoff. Verify: a unit test seeds runs at fixed timestamps and asserts rows older
+     than the cutoff are excluded from the returned set.
+  2. `archon workflow runs --since bogus` exits non-zero with a clear "invalid duration"
+     message on stderr (no stack trace). Verify: a test asserting exit code != 0 and the
+     stderr string.
+  3. Omitting `--since` preserves today's default (unfiltered) output. Verify: existing
+     `workflow runs` tests continue to pass unmodified.
+
+  Rollback: one flag on one subcommand; revert the single commit. No schema change, no
+  new query paths for other commands.
