@@ -1,0 +1,9 @@
+{
+  "name": "decision-calibration",
+  "kind": "decision",
+  "description": "Judge-calibration suite for the decision-eval-suite: labelled architectural-decision / success-contract cases spanning the quality spectrum, with planted defects (scope creep, missing verification, gameable clauses, wrong-problem, irreversible, principle violation). Compared against human-labels.json to measure judge trustworthiness. The artifact under test is a DECISION/CONTRACT, not code.",
+  "scale": "Each dimension is scored 1-5 by the judge (5 = excellent, 1 = absent/broken).",
+  "dimensions": ["problem_fit", "scope_discipline", "verifiability", "gameability_resistance", "principle_alignment", "reversibility"],
+  "weights": { "problem_fit": 0.22, "scope_discipline": 0.18, "verifiability": 0.22, "gameability_resistance": 0.18, "principle_alignment": 0.12, "reversibility": 0.08 },
+  "thresholds": { "overall_min": 3.5, "dim_floor": 3.0, "case_min": 2, "regression_tolerance": 0.5 }
+}

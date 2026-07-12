@@ -1,0 +1,523 @@
+name: decision-eval-suite
+description: |
+  EXPERIMENTAL: the DECISION-quality sibling of standing-eval-suite. Where
+  standing-eval-suite gates CODE against a 5-dimension rubric, this gates
+  ARCHITECTURAL DECISIONS / SUCCESS-CONTRACTS against a 6-dimension rubric —
+  so a plan/ADR/"we will build X; done means Y; verified by Z" statement is
+  scored for the same class of defects that sink implementations one level up:
+  scope creep, unfalsifiable "done", gameable acceptance clauses, solving the
+  wrong problem, house-rule violations, and irreversible blast radius.
+
+  Same machinery as standing-eval-suite: a curated, version-controlled set of
+  LABELLED cases, three fresh-context judge votes, deterministic median-of-3
+  aggregation, an optional committed baseline, and a hard gate. Reuses the
+  dimension-agnostic eval-load-suite + eval-aggregate scripts verbatim — the
+  rubric (dims/weights/thresholds) lives in .archon/evals/<suite>/suite.json.
+
+  Dataset lives at `.archon/evals/<suite>/`:
+    suite.json      — 6-dim decision rubric + weights + thresholds (+ optional baseline.json)
+    cases/*.yaml    — one labelled case each (task / candidate / reference)
+  Select a suite with EVAL_SUITE. Decision suites are named `decision-*`
+  (decision-seed, decision-calibration, decision-regressions). NOTE: the shared
+  scripts default EVAL_SUITE to `seed`, which is a CODE suite — so a decision
+  run MUST set EVAL_SUITE to a decision-* suite:
+
+    EVAL_SUITE=decision-seed        bun run cli workflow run decision-eval-suite
+    EVAL_SUITE=decision-calibration bun run cli workflow run decision-eval-suite
+
+  If pointed at a code suite by mistake, the judge's self-check flags it and the
+  aggregate fails loud on a dimension mismatch — never a silent wrong PASS.
+
+  v1 SCOPE (this file): scores PRE-SUPPLIED decision artifacts carried in each
+  case (`candidate:`). Read-only — never edits the repo. Deterministic
+  aggregation; the LLM judge only scores 1-5 per dimension.
+
+  N-VOTE JUDGING: three independent fresh-context judge votes (score-1/2/3,
+  identical prompts, only the output filename differs); the aggregate takes the
+  per-case-per-dimension MEDIAN, de-flaking single-vote ±1 wobble.
+
+  DETECTION SEMANTICS: a suite MAY carry a `labels.json` next to suite.json —
+  failure-derived cases whose `candidate:` is an escaped DEFECT decision. For
+  those the gate INVERTS: the median score on the labelled trap dimension must
+  be <= max_score (the judge must CATCH the defect), and labelled cases are
+  excluded from the mean/threshold math. Labels live OUTSIDE the case YAMLs so
+  the judge stays blind. See .archon/evals/DECISION-README.md.
+
+  Model routing: scoring uses the `medium` tier x3 votes; the readable verdict
+  uses `small`; load + aggregate use no model.
+
+  IMPLEMENTATION NOTE: the two deterministic nodes are the SHARED named scripts
+  (.archon/scripts/eval-load-suite.ts, eval-aggregate.ts) — dimension-agnostic,
+  driven entirely by suite.json. Inline multi-line scripts truncate at the first
+  newline on Windows (bun -e), so named scripts are mandatory.
+
+tags: [eval, suite, decision, contract, governance, agentic-engineering, sdlc]
+provider: claude
+mutates_checkout: false
+# Read the operator's LIVE checkout (where .archon/evals/<suite> lives), not an
+# isolated empty worktree. No $BASE_BRANCH / base tokens anywhere (not even in
+# comments) — they force eager base resolution that hard-fails on no-origin repos.
+worktree:
+  enabled: false
+
+nodes:
+  # NOTE: score-1/2/3 prompts are duplicated; they differ ONLY in the output
+  # filename (results-1/2/3.json). Keep all three in sync manually until Archon
+  # adds workflow templating.
+
+  # ─── 1. LOAD SUITE (deterministic, no AI) ─────────────────────────────
+  - id: load-suite
+    script: eval-load-suite
+    runtime: bun
+    timeout: 30000
+
+  # ─── 2. SCORE CASES — 3 INDEPENDENT VOTES (reasoning judge x3) ─────────
+  - id: score-1
+    depends_on: [load-suite]
+    model: medium
+    context: fresh
+    allowed_tools: [Read, Write]
+    timeout: 300000
+    prompt: |
+      You are a strict DECISION-QUALITY JUDGE. You score proposed ARCHITECTURAL
+      DECISIONS / SUCCESS-CONTRACTS — NOT code. A "candidate" here is a plan, an
+      ADR, or a "we will build X; done means Y; verified by Z" statement. Score
+      each case on a fixed 6-dimension rubric. Be conservative: when evidence for
+      a dimension is ABSENT from the contract, score it LOW — "set the bar at the
+      contract, not the good intentions." Do NOT edit any repo files.
+
+      ## Where the cases are
+      The file `$ARTIFACTS_DIR/eval/queue.txt` contains one absolute path per
+      line, each pointing at a YAML case file. Read that list, then Read EVERY
+      case file.
+
+      **CRITICAL BLINDNESS CONSTRAINT:** Read ONLY queue.txt and the exact case
+      files it lists. Do NOT read, attempt to read, infer, or reference
+      labels.json, human-labels.json, baseline.json, suite.json, or ANY other
+      file in the eval directory or the repo. Everything you need to judge is in
+      the case files and this prompt. If you find yourself wanting to read any
+      other file, STOP and score from what the case actually contains.
+
+      Each case has: `id`, `task` (the SITUATION / what was asked — the context
+      the decision responds to), `candidate` (the proposed decision/contract
+      under test), and `reference` (what a SOUND decision for this situation
+      looks like).
+
+      **SANITY SELF-CHECK:** these candidates must read like DECISIONS/CONTRACTS
+      (prose about what will be built, how "done" is defined, how it's verified).
+      If a candidate is instead a block of source code with functions/tests, you
+      have been pointed at a CODE suite by mistake — note "WRONG SUITE: candidates
+      are code, not decisions" in every rationale and score conservatively; do not
+      invent decision-quality judgments about code.
+
+      ## The 6 dimensions (score each 1-5: 5 = excellent, 1 = absent/broken)
+
+      - problem_fit — Does the decision correctly identify and target the REAL
+        problem stated in `task`? Is the causal reasoning sound, and are the
+        load-bearing assumptions made explicit? A decision that solves an
+        ADJACENT or WRONG problem, or silently rests on a false/unstated
+        assumption, scores LOW even if internally polished.
+
+      - scope_discipline — Is the scope MINIMAL and matched to the problem? Score
+        LOW for scope creep: speculative abstractions, unrequested features,
+        premature generalization, "while we're here" additions, gold-plating,
+        config/flags with no current caller. A strong decision names explicit
+        NON-GOALS.
+        MANDATORY INSPECTION: enumerate what the decision actually COMMITS to
+        building/changing, then check each item traces to a stated need in
+        `task`. Every commitment with no corresponding need is scope creep — the
+        more untraceable commitments, the lower the score.
+
+      - verifiability — Are the success criteria OBJECTIVE, FALSIFIABLE, and each
+        paired with a CONCRETE verification method? "Done" must be provable by
+        someone other than the author.
+        MANDATORY INSPECTION: for each success criterion, identify the exact
+        check that would prove it and ask "could this check actually FAIL if the
+        work were wrong?" A criterion with no named check, or a check that cannot
+        fail (vacuous), is NOT verification — score LOW. Vague criteria ("it
+        works", "looks good", "is tested", "improves UX") with no stated HOW are
+        unfalsifiable: score LOW.
+
+      - gameability_resistance — Are the acceptance criteria robust against
+        VACUOUS or ADVERSARIAL satisfaction? Score LOW if a lazy or adversarial
+        implementer could technically satisfy the contract without delivering the
+        real value.
+        MANDATORY INSPECTION: for each acceptance criterion, construct the
+        LAZIEST implementation that still passes it (a stub, a tautology,
+        happy-path-only, metric-gaming, "the test suite passes" when the tests
+        could be empty, "no errors in the log" when nothing logs). If that lazy
+        pass would leave the real goal in `task` unmet, the clause is gameable —
+        score LOW.
+
+      - principle_alignment — Does the decision respect this project's STANDING
+        CONSTRAINTS and engineering principles? Score LOW if it violates or
+        ignores one. The constraints (you do NOT need to read any file — they are
+        listed here):
+          * Single-tenant per install — NO multi-tenant isolation, per-tenant
+            row-scoping, or tenant multiplexing. (Multi-USER within one install
+            is fine and is NOT a violation — do not confuse the two.)
+          * Strict type-safety — no `any` without explicit justification;
+            complete type annotations; Zod schemas with `z.infer`, not parallel
+            hand-written interfaces.
+          * KISS / YAGNI — no config keys, interface methods, feature flags, or
+            abstractions without a concrete current caller. (Scope creep is
+            scored separately under scope_discipline; here, judge house-rule fit.)
+          * Fail-fast + explicit errors — never silently swallow errors or add a
+            silent fallback; never silently broaden permissions/capabilities.
+          * No autonomous lifecycle mutation across process boundaries — don't
+            mark work started elsewhere (CLI/webhook/adapter) as failed/cancelled
+            on a timer/staleness guess; surface the ambiguous state instead.
+          * Determinism + reproducibility; git as a first-class citizen (never
+            `git clean -fd`; trust git's guardrails).
+        A decision need not RESTATE these, but must not CONTRADICT them. If the
+        decision is domain-neutral and touches none of them, score around 3-4
+        (neutral), not 5 — reserve 5 for decisions that visibly honor a relevant
+        constraint.
+
+      - reversibility — Is the blast radius BOUNDED and the ROLLBACK path
+        explicit? A strong decision is small in scope, states how to undo it, and
+        avoids mixed mega-changes that block safe rollback. Score LOW for
+        irreversible, large, all-or-nothing decisions with no rollback named
+        (destructive data migrations with no back-out, one-way doors presented as
+        routine).
+
+      Judge the candidate against the reference and the task. Give a one-line
+      rationale per dimension GROUNDED in what the candidate actually says (quote
+      or paraphrase the specific clause you are reacting to).
+
+      ## Output (REQUIRED)
+      Write a single JSON ARRAY to `$ARTIFACTS_DIR/eval/results-1.json` using the
+      Write tool — one object per case, in this exact shape:
+      [
+        {
+          "case_id": "<the case id>",
+          "scores": {
+            "problem_fit":            { "score": 1, "rationale": "..." },
+            "scope_discipline":       { "score": 1, "rationale": "..." },
+            "verifiability":          { "score": 1, "rationale": "..." },
+            "gameability_resistance": { "score": 1, "rationale": "..." },
+            "principle_alignment":    { "score": 1, "rationale": "..." },
+            "reversibility":          { "score": 1, "rationale": "..." }
+          }
+        }
+      ]
+      Include EVERY case from the queue exactly once. Valid JSON only (no
+      comments, no trailing commas).
+      **CRITICAL: When writing JSON strings that contain backslashes, quotes, or
+      special characters (from quoted clauses, code snippets, regex, paths),
+      escape them properly: backslash becomes \\, quote becomes \", newline
+      becomes \n, etc. Use JSON.stringify() semantics.**
+      After writing, reply with a one-line confirmation of how many cases you scored.
+
+  - id: score-2
+    depends_on: [load-suite]
+    model: medium
+    context: fresh
+    allowed_tools: [Read, Write]
+    timeout: 300000
+    prompt: |
+      You are a strict DECISION-QUALITY JUDGE. You score proposed ARCHITECTURAL
+      DECISIONS / SUCCESS-CONTRACTS — NOT code. A "candidate" here is a plan, an
+      ADR, or a "we will build X; done means Y; verified by Z" statement. Score
+      each case on a fixed 6-dimension rubric. Be conservative: when evidence for
+      a dimension is ABSENT from the contract, score it LOW — "set the bar at the
+      contract, not the good intentions." Do NOT edit any repo files.
+
+      ## Where the cases are
+      The file `$ARTIFACTS_DIR/eval/queue.txt` contains one absolute path per
+      line, each pointing at a YAML case file. Read that list, then Read EVERY
+      case file.
+
+      **CRITICAL BLINDNESS CONSTRAINT:** Read ONLY queue.txt and the exact case
+      files it lists. Do NOT read, attempt to read, infer, or reference
+      labels.json, human-labels.json, baseline.json, suite.json, or ANY other
+      file in the eval directory or the repo. Everything you need to judge is in
+      the case files and this prompt. If you find yourself wanting to read any
+      other file, STOP and score from what the case actually contains.
+
+      Each case has: `id`, `task` (the SITUATION / what was asked — the context
+      the decision responds to), `candidate` (the proposed decision/contract
+      under test), and `reference` (what a SOUND decision for this situation
+      looks like).
+
+      **SANITY SELF-CHECK:** these candidates must read like DECISIONS/CONTRACTS
+      (prose about what will be built, how "done" is defined, how it's verified).
+      If a candidate is instead a block of source code with functions/tests, you
+      have been pointed at a CODE suite by mistake — note "WRONG SUITE: candidates
+      are code, not decisions" in every rationale and score conservatively; do not
+      invent decision-quality judgments about code.
+
+      ## The 6 dimensions (score each 1-5: 5 = excellent, 1 = absent/broken)
+
+      - problem_fit — Does the decision correctly identify and target the REAL
+        problem stated in `task`? Is the causal reasoning sound, and are the
+        load-bearing assumptions made explicit? A decision that solves an
+        ADJACENT or WRONG problem, or silently rests on a false/unstated
+        assumption, scores LOW even if internally polished.
+
+      - scope_discipline — Is the scope MINIMAL and matched to the problem? Score
+        LOW for scope creep: speculative abstractions, unrequested features,
+        premature generalization, "while we're here" additions, gold-plating,
+        config/flags with no current caller. A strong decision names explicit
+        NON-GOALS.
+        MANDATORY INSPECTION: enumerate what the decision actually COMMITS to
+        building/changing, then check each item traces to a stated need in
+        `task`. Every commitment with no corresponding need is scope creep — the
+        more untraceable commitments, the lower the score.
+
+      - verifiability — Are the success criteria OBJECTIVE, FALSIFIABLE, and each
+        paired with a CONCRETE verification method? "Done" must be provable by
+        someone other than the author.
+        MANDATORY INSPECTION: for each success criterion, identify the exact
+        check that would prove it and ask "could this check actually FAIL if the
+        work were wrong?" A criterion with no named check, or a check that cannot
+        fail (vacuous), is NOT verification — score LOW. Vague criteria ("it
+        works", "looks good", "is tested", "improves UX") with no stated HOW are
+        unfalsifiable: score LOW.
+
+      - gameability_resistance — Are the acceptance criteria robust against
+        VACUOUS or ADVERSARIAL satisfaction? Score LOW if a lazy or adversarial
+        implementer could technically satisfy the contract without delivering the
+        real value.
+        MANDATORY INSPECTION: for each acceptance criterion, construct the
+        LAZIEST implementation that still passes it (a stub, a tautology,
+        happy-path-only, metric-gaming, "the test suite passes" when the tests
+        could be empty, "no errors in the log" when nothing logs). If that lazy
+        pass would leave the real goal in `task` unmet, the clause is gameable —
+        score LOW.
+
+      - principle_alignment — Does the decision respect this project's STANDING
+        CONSTRAINTS and engineering principles? Score LOW if it violates or
+        ignores one. The constraints (you do NOT need to read any file — they are
+        listed here):
+          * Single-tenant per install — NO multi-tenant isolation, per-tenant
+            row-scoping, or tenant multiplexing. (Multi-USER within one install
+            is fine and is NOT a violation — do not confuse the two.)
+          * Strict type-safety — no `any` without explicit justification;
+            complete type annotations; Zod schemas with `z.infer`, not parallel
+            hand-written interfaces.
+          * KISS / YAGNI — no config keys, interface methods, feature flags, or
+            abstractions without a concrete current caller. (Scope creep is
+            scored separately under scope_discipline; here, judge house-rule fit.)
+          * Fail-fast + explicit errors — never silently swallow errors or add a
+            silent fallback; never silently broaden permissions/capabilities.
+          * No autonomous lifecycle mutation across process boundaries — don't
+            mark work started elsewhere (CLI/webhook/adapter) as failed/cancelled
+            on a timer/staleness guess; surface the ambiguous state instead.
+          * Determinism + reproducibility; git as a first-class citizen (never
+            `git clean -fd`; trust git's guardrails).
+        A decision need not RESTATE these, but must not CONTRADICT them. If the
+        decision is domain-neutral and touches none of them, score around 3-4
+        (neutral), not 5 — reserve 5 for decisions that visibly honor a relevant
+        constraint.
+
+      - reversibility — Is the blast radius BOUNDED and the ROLLBACK path
+        explicit? A strong decision is small in scope, states how to undo it, and
+        avoids mixed mega-changes that block safe rollback. Score LOW for
+        irreversible, large, all-or-nothing decisions with no rollback named
+        (destructive data migrations with no back-out, one-way doors presented as
+        routine).
+
+      Judge the candidate against the reference and the task. Give a one-line
+      rationale per dimension GROUNDED in what the candidate actually says (quote
+      or paraphrase the specific clause you are reacting to).
+
+      ## Output (REQUIRED)
+      Write a single JSON ARRAY to `$ARTIFACTS_DIR/eval/results-2.json` using the
+      Write tool — one object per case, in this exact shape:
+      [
+        {
+          "case_id": "<the case id>",
+          "scores": {
+            "problem_fit":            { "score": 1, "rationale": "..." },
+            "scope_discipline":       { "score": 1, "rationale": "..." },
+            "verifiability":          { "score": 1, "rationale": "..." },
+            "gameability_resistance": { "score": 1, "rationale": "..." },
+            "principle_alignment":    { "score": 1, "rationale": "..." },
+            "reversibility":          { "score": 1, "rationale": "..." }
+          }
+        }
+      ]
+      Include EVERY case from the queue exactly once. Valid JSON only (no
+      comments, no trailing commas).
+      **CRITICAL: When writing JSON strings that contain backslashes, quotes, or
+      special characters (from quoted clauses, code snippets, regex, paths),
+      escape them properly: backslash becomes \\, quote becomes \", newline
+      becomes \n, etc. Use JSON.stringify() semantics.**
+      After writing, reply with a one-line confirmation of how many cases you scored.
+
+  - id: score-3
+    depends_on: [load-suite]
+    model: medium
+    context: fresh
+    allowed_tools: [Read, Write]
+    timeout: 300000
+    prompt: |
+      You are a strict DECISION-QUALITY JUDGE. You score proposed ARCHITECTURAL
+      DECISIONS / SUCCESS-CONTRACTS — NOT code. A "candidate" here is a plan, an
+      ADR, or a "we will build X; done means Y; verified by Z" statement. Score
+      each case on a fixed 6-dimension rubric. Be conservative: when evidence for
+      a dimension is ABSENT from the contract, score it LOW — "set the bar at the
+      contract, not the good intentions." Do NOT edit any repo files.
+
+      ## Where the cases are
+      The file `$ARTIFACTS_DIR/eval/queue.txt` contains one absolute path per
+      line, each pointing at a YAML case file. Read that list, then Read EVERY
+      case file.
+
+      **CRITICAL BLINDNESS CONSTRAINT:** Read ONLY queue.txt and the exact case
+      files it lists. Do NOT read, attempt to read, infer, or reference
+      labels.json, human-labels.json, baseline.json, suite.json, or ANY other
+      file in the eval directory or the repo. Everything you need to judge is in
+      the case files and this prompt. If you find yourself wanting to read any
+      other file, STOP and score from what the case actually contains.
+
+      Each case has: `id`, `task` (the SITUATION / what was asked — the context
+      the decision responds to), `candidate` (the proposed decision/contract
+      under test), and `reference` (what a SOUND decision for this situation
+      looks like).
+
+      **SANITY SELF-CHECK:** these candidates must read like DECISIONS/CONTRACTS
+      (prose about what will be built, how "done" is defined, how it's verified).
+      If a candidate is instead a block of source code with functions/tests, you
+      have been pointed at a CODE suite by mistake — note "WRONG SUITE: candidates
+      are code, not decisions" in every rationale and score conservatively; do not
+      invent decision-quality judgments about code.
+
+      ## The 6 dimensions (score each 1-5: 5 = excellent, 1 = absent/broken)
+
+      - problem_fit — Does the decision correctly identify and target the REAL
+        problem stated in `task`? Is the causal reasoning sound, and are the
+        load-bearing assumptions made explicit? A decision that solves an
+        ADJACENT or WRONG problem, or silently rests on a false/unstated
+        assumption, scores LOW even if internally polished.
+
+      - scope_discipline — Is the scope MINIMAL and matched to the problem? Score
+        LOW for scope creep: speculative abstractions, unrequested features,
+        premature generalization, "while we're here" additions, gold-plating,
+        config/flags with no current caller. A strong decision names explicit
+        NON-GOALS.
+        MANDATORY INSPECTION: enumerate what the decision actually COMMITS to
+        building/changing, then check each item traces to a stated need in
+        `task`. Every commitment with no corresponding need is scope creep — the
+        more untraceable commitments, the lower the score.
+
+      - verifiability — Are the success criteria OBJECTIVE, FALSIFIABLE, and each
+        paired with a CONCRETE verification method? "Done" must be provable by
+        someone other than the author.
+        MANDATORY INSPECTION: for each success criterion, identify the exact
+        check that would prove it and ask "could this check actually FAIL if the
+        work were wrong?" A criterion with no named check, or a check that cannot
+        fail (vacuous), is NOT verification — score LOW. Vague criteria ("it
+        works", "looks good", "is tested", "improves UX") with no stated HOW are
+        unfalsifiable: score LOW.
+
+      - gameability_resistance — Are the acceptance criteria robust against
+        VACUOUS or ADVERSARIAL satisfaction? Score LOW if a lazy or adversarial
+        implementer could technically satisfy the contract without delivering the
+        real value.
+        MANDATORY INSPECTION: for each acceptance criterion, construct the
+        LAZIEST implementation that still passes it (a stub, a tautology,
+        happy-path-only, metric-gaming, "the test suite passes" when the tests
+        could be empty, "no errors in the log" when nothing logs). If that lazy
+        pass would leave the real goal in `task` unmet, the clause is gameable —
+        score LOW.
+
+      - principle_alignment — Does the decision respect this project's STANDING
+        CONSTRAINTS and engineering principles? Score LOW if it violates or
+        ignores one. The constraints (you do NOT need to read any file — they are
+        listed here):
+          * Single-tenant per install — NO multi-tenant isolation, per-tenant
+            row-scoping, or tenant multiplexing. (Multi-USER within one install
+            is fine and is NOT a violation — do not confuse the two.)
+          * Strict type-safety — no `any` without explicit justification;
+            complete type annotations; Zod schemas with `z.infer`, not parallel
+            hand-written interfaces.
+          * KISS / YAGNI — no config keys, interface methods, feature flags, or
+            abstractions without a concrete current caller. (Scope creep is
+            scored separately under scope_discipline; here, judge house-rule fit.)
+          * Fail-fast + explicit errors — never silently swallow errors or add a
+            silent fallback; never silently broaden permissions/capabilities.
+          * No autonomous lifecycle mutation across process boundaries — don't
+            mark work started elsewhere (CLI/webhook/adapter) as failed/cancelled
+            on a timer/staleness guess; surface the ambiguous state instead.
+          * Determinism + reproducibility; git as a first-class citizen (never
+            `git clean -fd`; trust git's guardrails).
+        A decision need not RESTATE these, but must not CONTRADICT them. If the
+        decision is domain-neutral and touches none of them, score around 3-4
+        (neutral), not 5 — reserve 5 for decisions that visibly honor a relevant
+        constraint.
+
+      - reversibility — Is the blast radius BOUNDED and the ROLLBACK path
+        explicit? A strong decision is small in scope, states how to undo it, and
+        avoids mixed mega-changes that block safe rollback. Score LOW for
+        irreversible, large, all-or-nothing decisions with no rollback named
+        (destructive data migrations with no back-out, one-way doors presented as
+        routine).
+
+      Judge the candidate against the reference and the task. Give a one-line
+      rationale per dimension GROUNDED in what the candidate actually says (quote
+      or paraphrase the specific clause you are reacting to).
+
+      ## Output (REQUIRED)
+      Write a single JSON ARRAY to `$ARTIFACTS_DIR/eval/results-3.json` using the
+      Write tool — one object per case, in this exact shape:
+      [
+        {
+          "case_id": "<the case id>",
+          "scores": {
+            "problem_fit":            { "score": 1, "rationale": "..." },
+            "scope_discipline":       { "score": 1, "rationale": "..." },
+            "verifiability":          { "score": 1, "rationale": "..." },
+            "gameability_resistance": { "score": 1, "rationale": "..." },
+            "principle_alignment":    { "score": 1, "rationale": "..." },
+            "reversibility":          { "score": 1, "rationale": "..." }
+          }
+        }
+      ]
+      Include EVERY case from the queue exactly once. Valid JSON only (no
+      comments, no trailing commas).
+      **CRITICAL: When writing JSON strings that contain backslashes, quotes, or
+      special characters (from quoted clauses, code snippets, regex, paths),
+      escape them properly: backslash becomes \\, quote becomes \", newline
+      becomes \n, etc. Use JSON.stringify() semantics.**
+      After writing, reply with a one-line confirmation of how many cases you scored.
+
+  # ─── 3. AGGREGATE (deterministic gate, no AI) ─────────────────────────
+  # Shared script — dimension-agnostic. Median-of-3 per case per dimension,
+  # queue-identity check, optional labels.json detection gate, thresholds,
+  # baseline regression. Reads dims/weights/thresholds from suite.json.
+  - id: aggregate
+    depends_on: [score-1, score-2, score-3]
+    script: eval-aggregate
+    runtime: bun
+    timeout: 30000
+
+  # ─── 4. VERDICT (cheap readable synthesis) ────────────────────────────
+  - id: verdict
+    depends_on: [aggregate]
+    model: small
+    context: fresh
+    allowed_tools: []
+    timeout: 60000
+    prompt: |
+      The deterministic scorecard below already contains the AUTHORITATIVE gate
+      decision for a set of ARCHITECTURAL DECISIONS / CONTRACTS. Restate it for a
+      human — do NOT recompute or override it. If the gate is FAIL, lead with the
+      concrete blocking reasons (dimension-floor failures, per-case failures,
+      detection misses, regressions).
+
+      ## Scorecard
+      $aggregate.output
+    output_format:
+      type: object
+      properties:
+        gate:
+          type: string
+          enum: [PASS, FAIL]
+        overall: { type: number }
+        blocking:
+          type: array
+          items: { type: string }
+        summary: { type: string }
+      required: [gate, summary]

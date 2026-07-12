@@ -1,0 +1,20 @@
+id: weak-runs-overhaul
+tags: [anchor, weak]
+task: |
+  Operators say the workflow runs list is hard to scan when there are many runs.
+  Decide how to improve it.
+reference: |
+  A sound decision scopes to the specific complaint (scanning a long list),
+  commits only to changes that trace to it, defines "improved" with an objective,
+  checkable criterion, keeps the change small and revertible, and avoids
+  speculative abstractions with no current caller.
+candidate: |
+  Decision: overhaul the run-management experience to make it delightful. We will
+  add a new interactive TUI dashboard for runs, introduce a caching layer so
+  listing is instant, add colored status badges, and add a plugin system so teams
+  can register custom columns. While we are in there we will also refactor the run
+  store behind a generic repository interface for future reuse. This modernizes the
+  whole surface at once.
+
+  Done means: the runs list feels much cleaner and operators are happy. We will know
+  it is working when it looks good in a demo and nobody complains.

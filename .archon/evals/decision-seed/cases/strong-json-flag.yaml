@@ -1,0 +1,32 @@
+id: strong-json-flag
+tags: [anchor, strong]
+task: |
+  The `archon workflow get <id>` CLI command prints a human-readable run summary.
+  Operators scripting around it have asked for machine-readable output so they can
+  pipe run status into other tools. Decide how to add machine-readable output.
+reference: |
+  A sound decision scopes to exactly the one command asked about, commits only to
+  changes that trace to that need, defines "done" with objective checks a third
+  party could run, resists a lazy/vacuous pass, respects fail-fast on bad input,
+  and stays small and revertible.
+candidate: |
+  Decision: add a `--json` flag to `archon workflow get <id>` that prints the run
+  record the command already loads as a single JSON object to stdout, and
+  suppresses the human-readable rendering.
+
+  Scope (non-goals stated explicitly): ONLY `workflow get`. NOT `list`, `status`,
+  or `runs` (they already expose `--json` or are out of scope). No new fields — the
+  JSON is the existing run record. No new config, no flags beyond `--json`.
+
+  Done means:
+  1. `archon workflow get <id> --json` exits 0 and its stdout parses as JSON whose
+     `id` equals `<id>`. Verify: `archon workflow get <id> --json | jq -e '.id == "<id>"'`.
+  2. Without `--json`, human output is byte-for-byte unchanged. Verify: a golden-output
+     test in packages/cli comparing pre/post stdout for a fixed run fixture.
+  3. `--json` on a missing id exits non-zero and prints `{ "error": ... }` JSON to
+     stderr (no stack trace). Verify: a test asserting exit code != 0 AND stderr parses as JSON.
+
+  Verification runs in `bun run test` (CI) plus the one manual `jq -e` check above.
+
+  Rollback: one flag on one command; revert the single commit. No schema change, no
+  data migration, no persisted state touched.
