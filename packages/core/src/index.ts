@@ -80,6 +80,7 @@ export * as isolationOperations from './operations/isolation-operations';
 // Orchestrator
 // =============================================================================
 export { handleMessage } from './orchestrator/orchestrator-agent';
+export { dispatchReviewWorkflowByName } from './orchestrator/ambient-review';
 export {
   buildOrchestratorPrompt,
   buildProjectScopedPrompt,

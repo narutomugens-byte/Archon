@@ -527,6 +527,145 @@ describe('GitHubAdapter', () => {
     });
   });
 
+  describe('parseEvent — pull_request.opened', () => {
+    /**
+     * Build a minimal pull_request.opened webhook payload. The `fork` option
+     * sets the head repo to a different full_name so fork detection works.
+     */
+    function createPullRequestOpenedPayload(opts: { fork?: boolean } = {}): string {
+      return JSON.stringify({
+        action: 'opened',
+        pull_request: {
+          number: 101,
+          title: 'Add feature',
+          body: 'Description',
+          user: { login: 'prauthor' },
+          state: 'open',
+          head: {
+            ref: 'feature-branch',
+            sha: 'abc123def456',
+            repo: { full_name: opts.fork ? 'fork-user/testrepo' : 'testuser/testrepo' },
+          },
+        },
+        repository: {
+          owner: { login: 'testuser' },
+          name: 'testrepo',
+          full_name: 'testuser/testrepo',
+          html_url: 'https://github.com/testuser/testrepo',
+          default_branch: 'main',
+        },
+        sender: { login: 'prauthor' },
+      });
+    }
+
+    function createPullRequestClosedPayload(merged = true): string {
+      return JSON.stringify({
+        action: 'closed',
+        pull_request: {
+          number: 101,
+          title: 'Add feature',
+          body: 'Description',
+          user: { login: 'prauthor' },
+          state: 'closed',
+          merged,
+        },
+        repository: {
+          owner: { login: 'testuser' },
+          name: 'testrepo',
+          full_name: 'testuser/testrepo',
+          html_url: 'https://github.com/testuser/testrepo',
+          default_branch: 'main',
+        },
+        sender: { login: 'prauthor' },
+      });
+    }
+
+    test('parseEvent returns isOpenedPR=true for pull_request.opened', () => {
+      const testAdapter = new GitHubAdapter(
+        { kind: 'pat', token: 'fake-token' },
+        'fake-secret',
+        mockLockManager
+      );
+      const event = JSON.parse(createPullRequestOpenedPayload());
+      // @ts-expect-error - accessing private method
+      const result = testAdapter.parseEvent(event) as {
+        isOpenedPR?: boolean;
+        isCloseEvent?: boolean;
+        isMerged?: boolean;
+        number: number;
+        owner: string;
+        repo: string;
+      } | null;
+      expect(result).not.toBeNull();
+      expect(result?.isOpenedPR).toBe(true);
+      expect(result?.isCloseEvent).toBeUndefined();
+      expect(result?.isMerged).toBeUndefined();
+      expect(result?.number).toBe(101);
+      expect(result?.owner).toBe('testuser');
+      expect(result?.repo).toBe('testrepo');
+    });
+
+    test('parseEvent still returns isCloseEvent for pull_request.closed (regression)', () => {
+      const testAdapter = new GitHubAdapter(
+        { kind: 'pat', token: 'fake-token' },
+        'fake-secret',
+        mockLockManager
+      );
+      const event = JSON.parse(createPullRequestClosedPayload(true));
+      // @ts-expect-error - accessing private method
+      const result = testAdapter.parseEvent(event) as {
+        isOpenedPR?: boolean;
+        isCloseEvent?: boolean;
+        isMerged?: boolean;
+        number: number;
+      } | null;
+      expect(result).not.toBeNull();
+      expect(result?.isCloseEvent).toBe(true);
+      expect(result?.isMerged).toBe(true);
+      expect(result?.isOpenedPR).toBeUndefined();
+      expect(result?.number).toBe(101);
+    });
+
+    test('parseEvent returns non-null for issue_comment with correct eventType', () => {
+      const testAdapter = new GitHubAdapter(
+        { kind: 'pat', token: 'fake-token' },
+        'fake-secret',
+        mockLockManager
+      );
+      const event = {
+        action: 'created',
+        issue: {
+          number: 42,
+          title: 'Test Issue',
+          body: '',
+          user: { login: 'user' },
+          labels: [],
+          state: 'open',
+        },
+        comment: { body: 'hello @archon do something', user: { login: 'user' } },
+        repository: {
+          owner: { login: 'testuser' },
+          name: 'testrepo',
+          full_name: 'testuser/testrepo',
+          html_url: 'https://github.com/testuser/testrepo',
+          default_branch: 'main',
+        },
+        sender: { login: 'user' },
+      };
+      // @ts-expect-error - accessing private method
+      const result = testAdapter.parseEvent(event) as {
+        eventType: string;
+        isOpenedPR?: boolean;
+        isCloseEvent?: boolean;
+      } | null;
+      expect(result).not.toBeNull();
+      expect(result?.eventType).toBe('issue_comment');
+      // Neither flag set for comment events
+      expect(result?.isOpenedPR).toBeUndefined();
+      expect(result?.isCloseEvent).toBeUndefined();
+    });
+  });
+
   describe('worktree path detection helpers', () => {
     test('paths containing /worktrees/ should be detected', () => {
       const worktreePath = '/workspace/worktrees/issue-42/repo';

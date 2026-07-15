@@ -6,7 +6,7 @@ import { Octokit } from '@octokit/rest';
 import { createHmac, timingSafeEqual } from 'crypto';
 import { readdir, access } from 'fs/promises';
 import { join } from 'path';
-import type { IPlatformAdapter, MessageMetadata, GitHubAuth } from '@archon/core';
+import type { IPlatformAdapter, MessageMetadata, GitHubAuth, MergedConfig } from '@archon/core';
 import type { IsolationHints } from '@archon/isolation';
 import {
   ConversationNotFoundError,
@@ -18,6 +18,7 @@ import {
   ConversationLockManager,
   AppNotInstalledError,
   installCredentialHelper,
+  dispatchReviewWorkflowByName,
 } from '@archon/core';
 import {
   ensureProjectStructure,
@@ -74,6 +75,11 @@ export class GitHubAdapter implements IPlatformAdapter {
    */
   private readonly getUserToken?: (userId: string) => Promise<string | undefined>;
   /**
+   * Ambient PR review config. When enabled, deterministically dispatches a named
+   * review workflow on pull_request.opened events. Default-off. Never merges.
+   */
+  private readonly ambientReview: MergedConfig['ambientReview'] | undefined;
+  /**
    * conversationId → originating Archon userId (the last human to trigger this
    * thread). Populated in handleWebhook; read in postComment to route the reply
    * through that user's token. App mode only; lost on restart (graceful: falls
@@ -91,6 +97,7 @@ export class GitHubAdapter implements IPlatformAdapter {
     options?: {
       retryDelayMs?: (attempt: number) => number;
       getUserToken?: (userId: string) => Promise<string | undefined>;
+      ambientReview?: MergedConfig['ambientReview'];
     }
   ) {
     this.auth = auth;
@@ -99,6 +106,7 @@ export class GitHubAdapter implements IPlatformAdapter {
     this.lockManager = lockManager;
     this.botMention = botMention ?? 'Archon';
     this.getUserToken = options?.getUserToken;
+    this.ambientReview = options?.ambientReview;
 
     // Parse GitHub user whitelist (optional - empty = open access)
     this.allowedUsers = parseGitHubAllowedUsers(process.env.GITHUB_ALLOWED_USERS);
@@ -111,7 +119,13 @@ export class GitHubAdapter implements IPlatformAdapter {
     this.retryDelayFn = options?.retryDelayMs ?? ((attempt: number): number => 1000 * attempt);
 
     getLog().info(
-      { botMention: this.botMention, authMode: auth.kind },
+      {
+        botMention: this.botMention,
+        authMode: auth.kind,
+        ambientReviewEnabled: this.ambientReview?.enabled ?? false,
+        ambientReviewWorkflow: this.ambientReview?.workflow,
+        ambientReviewForkPolicy: this.ambientReview?.forkPolicy ?? 'skip',
+      },
       'github.adapter_initialized'
     );
   }
@@ -474,10 +488,11 @@ export class GitHubAdapter implements IPlatformAdapter {
    *
    * Handles:
    * - issues.closed / pull_request.closed → cleanup (isCloseEvent: true)
+   * - pull_request.opened → ambient review dispatch (isOpenedPR: true)
    * - issue_comment.created → bot @mention detection
    *
    * Does NOT handle:
-   * - issues.opened / pull_request.opened → returns null (see #96)
+   * - issues.opened → returns null (see #96)
    */
   private parseEvent(event: WebhookEvent): {
     owner: string;
@@ -489,6 +504,7 @@ export class GitHubAdapter implements IPlatformAdapter {
     pullRequest?: WebhookEvent['pull_request'];
     isCloseEvent?: boolean;
     isMerged?: boolean;
+    isOpenedPR?: boolean;
   } | null {
     const owner = event.repository.owner.login;
     const repo = event.repository.name;
@@ -520,6 +536,19 @@ export class GitHubAdapter implements IPlatformAdapter {
       };
     }
 
+    // Detect PR opened — ambient review dispatch path
+    if (event.pull_request && event.action === 'opened') {
+      return {
+        owner,
+        repo,
+        number: event.pull_request.number,
+        comment: '',
+        eventType: 'pull_request',
+        pullRequest: event.pull_request,
+        isOpenedPR: true,
+      };
+    }
+
     // issue_comment (covers both issues and PRs)
     if (event.comment) {
       const number = event.issue?.number ?? event.pull_request?.number;
@@ -536,10 +565,10 @@ export class GitHubAdapter implements IPlatformAdapter {
     }
 
     // Note: We intentionally do NOT handle issues.opened or pull_request.opened
-    // events here. Issue/PR descriptions often contain example commands or
-    // documentation about how to use the bot - these are NOT command invocations.
-    // Only actual comments (issue_comment events) trigger bot responses.
-    // See issue #96 for details.
+    // without a pull_request payload — issue descriptions often contain example
+    // commands or documentation about how to use the bot, which are NOT command
+    // invocations. Only actual comments (issue_comment events) trigger bot responses.
+    // PR opened events are handled above (ambient review path). See issue #96.
 
     return null;
   }
@@ -871,6 +900,124 @@ export class GitHubAdapter implements IPlatformAdapter {
   }
 
   /**
+   * Handle a pull_request.opened event by deterministically dispatching the
+   * configured review workflow. No AI involvement in the routing decision.
+   * Verdict is posted as a PR comment via the existing sendMessage path.
+   * Never merges.
+   */
+  private async handleAmbientPrReview(
+    event: WebhookEvent,
+    owner: string,
+    repo: string,
+    number: number
+  ): Promise<void> {
+    // 1. Feature flag check
+    if (!this.ambientReview?.enabled) return;
+
+    // 2. Workflow name check
+    if (!this.ambientReview.workflow) {
+      getLog().warn({ owner, repo, prNumber: number }, 'ambient_review.workflow_unset');
+      return;
+    }
+    const workflowName = this.ambientReview.workflow;
+
+    const pr = event.pull_request;
+    if (!pr) return; // Guard — should not happen for pull_request.opened
+
+    // 3. Fork gate from payload (no API call)
+    const headRepoFullName = pr.head?.repo?.full_name;
+    const isForkPR = headRepoFullName !== event.repository.full_name;
+    if (isForkPR && this.ambientReview.forkPolicy !== 'review') {
+      getLog().info(
+        { owner, repo, prNumber: number, headRepo: headRepoFullName },
+        'ambient_review.fork_skipped'
+      );
+      return;
+    }
+
+    // 4. Resolve codebase (same pattern as @archon-mention path)
+    const {
+      codebase: partialCodebase,
+      repoPath,
+      isNew: isNewCodebase,
+    } = await this.getOrCreateCodebaseForRepo(owner, repo);
+
+    // Fetch the full Codebase row (dispatchOrchestratorWorkflow needs all fields)
+    const codebase = await codebaseDb.getCodebase(partialCodebase.id);
+    if (!codebase) {
+      // Defensive — should not happen since we just created/fetched it above
+      getLog().error(
+        { codebaseId: partialCodebase.id, owner, repo },
+        'ambient_review.codebase_not_found'
+      );
+      return;
+    }
+
+    // Use default_branch from the webhook payload — avoids an extra API call
+    const defaultBranch = event.repository.default_branch;
+
+    // Ensure repo is cloned/synced
+    await this.ensureRepoReady(owner, repo, defaultBranch, repoPath, isNewCodebase);
+
+    // Load commands if codebase is new
+    if (isNewCodebase) {
+      await this.autoDetectAndLoadCommands(repoPath, codebase.id);
+    }
+
+    // 5. Build isolation hints
+    const isolationHints: IsolationHints = {
+      workflowType: 'pr',
+      workflowId: String(number),
+      prBranch: pr.head?.ref ? toBranchName(pr.head.ref) : undefined,
+      prSha: pr.head?.sha,
+      isForkPR,
+    };
+
+    // 6. Build conversationId and PR context message
+    const conversationId = this.buildConversationId(owner, repo, number);
+    // Do NOT populate actorByConversation — verdict posts as the bot/installation identity
+    const userMessage = this.buildPRContext(
+      pr,
+      `Please review this pull request (PR #${String(number)}).`
+    );
+
+    // Get or create the conversation record for this PR.
+    // dispatchOrchestratorWorkflow links it to the codebase internally.
+    const conversation = await db.getOrCreateConversation('github', conversationId);
+
+    // 7. Dispatch review workflow under a lock (same as @archon-mention path)
+    await this.lockManager.acquireLock(conversationId, async () => {
+      try {
+        // TODO(ambient-review): optional read-only credential mode
+        await dispatchReviewWorkflowByName(
+          this,
+          conversationId,
+          conversation,
+          codebase,
+          workflowName,
+          userMessage,
+          isolationHints
+        );
+      } catch (err) {
+        const error = toError(err);
+        getLog().error(
+          { err: error, conversationId, workflowName },
+          'ambient_review.dispatch_failed'
+        );
+        try {
+          const userMsg = classifyAndFormatError(error);
+          await this.sendMessage(conversationId, userMsg);
+        } catch (sendErr) {
+          getLog().error(
+            { err: toError(sendErr), conversationId },
+            'ambient_review.error_send_failed'
+          );
+        }
+      }
+    });
+  }
+
+  /**
    * Build context-rich message for issue
    */
   private buildIssueContext(issue: WebhookEvent['issue'], userComment: string): string {
@@ -953,6 +1100,15 @@ ${userComment}`;
     // call to this repo after a restart. No-op when payload lacks installation.
     if (this.auth.kind === 'app' && event.installation?.id !== undefined) {
       this.auth.provider.primeInstallationLookup(owner, repo, event.installation.id);
+    }
+
+    // Ambient PR review: deterministic dispatch on pull_request.opened.
+    // Runs after signature-verify, sender-authorization, and install-prime.
+    // No AI in the routing decision. Never merges. Returns early — the rest
+    // of the @mention pipeline (self-filter, mention check, etc.) is skipped.
+    if (parsed.isOpenedPR) {
+      await this.handleAmbientPrReview(event, owner, repo, number);
+      return;
     }
 
     // 3. Handle close/merge events (cleanup worktree)

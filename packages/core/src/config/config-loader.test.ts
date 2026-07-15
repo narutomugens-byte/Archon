@@ -909,4 +909,50 @@ tiers:
       expect(safe.tierDefaults?.small).toEqual({ provider: 'claude', model: 'haiku' });
     });
   });
+
+  describe('ambientReview config', () => {
+    test('defaults: enabled=false, forkPolicy=skip, workflow=undefined', async () => {
+      mockFsReadFile.mockResolvedValue('');
+      const config = await loadConfig();
+      expect(config.ambientReview.enabled).toBe(false);
+      expect(config.ambientReview.forkPolicy).toBe('skip');
+      expect(config.ambientReview.workflow).toBeUndefined();
+    });
+
+    test('global config enables ambientReview with workflow + forkPolicy', async () => {
+      mockFsReadFile.mockResolvedValue(`
+ambientReview:
+  enabled: true
+  workflow: pr-review
+  forkPolicy: review
+`);
+      const config = await loadConfig();
+      expect(config.ambientReview.enabled).toBe(true);
+      expect(config.ambientReview.workflow).toBe('pr-review');
+      expect(config.ambientReview.forkPolicy).toBe('review');
+    });
+
+    test('global config partially overrides: enabled only', async () => {
+      mockFsReadFile.mockResolvedValue(`
+ambientReview:
+  enabled: true
+`);
+      const config = await loadConfig();
+      // enabled overridden, forkPolicy + workflow stay at defaults
+      expect(config.ambientReview.enabled).toBe(true);
+      expect(config.ambientReview.forkPolicy).toBe('skip');
+      expect(config.ambientReview.workflow).toBeUndefined();
+    });
+
+    test('global config with workflow only, enabled stays false', async () => {
+      mockFsReadFile.mockResolvedValue(`
+ambientReview:
+  workflow: my-review-workflow
+`);
+      const config = await loadConfig();
+      // enabled stays false (only workflow was set)
+      expect(config.ambientReview.enabled).toBe(false);
+      expect(config.ambientReview.workflow).toBe('my-review-workflow');
+    });
+  });
 });

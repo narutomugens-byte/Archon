@@ -479,7 +479,7 @@ function filterToolIndicators(assistantMessages: string[]): string {
 
 // ─── Workflow Dispatch ──────────────────────────────────────────────────────
 
-interface WorkflowDispatchOptions {
+export interface WorkflowDispatchOptions {
   force?: boolean;
   resumeRunId?: string;
   resumeRun?: WorkflowRun;
@@ -553,10 +553,13 @@ function buildFailedRunResumePrompt(
  * Dispatch a workflow after the orchestrator resolves a project.
  * Auto-attaches the project to the conversation, resolves isolation, and executes.
  *
+ * Exported so ambient-review.ts can reuse it without duplicating isolation
+ * resolution, resume semantics, or background/foreground dispatch logic.
+ *
  * TODO(#988): Move to operations/ once dispatchBackgroundWorkflow is extracted
  * from the orchestrator (currently coupled to SSE bridging infrastructure).
  */
-async function dispatchOrchestratorWorkflow(
+export async function dispatchOrchestratorWorkflow(
   platform: IPlatformAdapter,
   conversationId: string,
   conversation: Conversation,

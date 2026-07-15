@@ -386,6 +386,7 @@ function getDefaults(): MergedConfig {
       loadDefaultCommands: true,
       loadDefaultWorkflows: true,
     },
+    ambientReview: { enabled: false, forkPolicy: 'skip' },
   };
 }
 
@@ -508,6 +509,15 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
   // Concurrency preferences
   if (global.concurrency?.maxConversations) {
     result.concurrency.maxConversations = global.concurrency.maxConversations;
+  }
+
+  // Ambient review settings — ??-merge each key individually
+  if (global.ambientReview) {
+    result.ambientReview = {
+      enabled: global.ambientReview.enabled ?? result.ambientReview.enabled,
+      workflow: global.ambientReview.workflow ?? result.ambientReview.workflow,
+      forkPolicy: global.ambientReview.forkPolicy ?? result.ambientReview.forkPolicy,
+    };
   }
 
   return result;

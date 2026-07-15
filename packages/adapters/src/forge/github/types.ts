@@ -19,6 +19,16 @@ export interface WebhookEvent {
     changed_files?: number;
     additions?: number;
     deletions?: number;
+    /**
+     * PR head ref info. Present on pull_request.opened (and most PR events).
+     * Used for isolation hints (prBranch, prSha) and fork detection.
+     */
+    head?: {
+      ref: string;
+      sha: string;
+      /** null when the fork has been deleted after PR creation */
+      repo: { full_name: string } | null;
+    };
   };
   comment?: {
     body: string;

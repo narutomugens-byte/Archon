@@ -71,6 +71,20 @@ export interface GlobalConfig {
   botName?: string;
 
   /**
+   * Ambient PR review configuration.
+   * When enabled, dispatches a named review workflow on pull_request.opened events.
+   * Default-off. Never merges.
+   */
+  ambientReview?: {
+    /** Enable ambient PR review dispatch. @default false */
+    enabled?: boolean;
+    /** Name of the review workflow to run. Required when enabled. */
+    workflow?: string;
+    /** Policy for fork PRs. @default 'skip' */
+    forkPolicy?: 'skip' | 'review';
+  };
+
+  /**
    * Default AI assistant when no codebase-specific preference
    * @default 'claude'
    */
@@ -339,6 +353,17 @@ export interface MergedConfig {
    * Undefined when no env vars are configured.
    */
   envVars?: Record<string, string>;
+
+  /**
+   * Ambient PR review configuration (resolved, always present after loadConfig).
+   * Dispatches a named review workflow on pull_request.opened when enabled.
+   * Default-off. Never merges.
+   */
+  ambientReview: {
+    enabled: boolean;
+    workflow?: string;
+    forkPolicy: 'skip' | 'review';
+  };
 }
 
 /**

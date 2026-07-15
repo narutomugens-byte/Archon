@@ -454,7 +454,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         ? async (userId: string): Promise<string | undefined> =>
             (await getDecryptedAccessToken(userId)) ?? undefined
         : undefined;
-      github = new GitHubAdapter(auth, webhookSecret, lockManager, botMention, { getUserToken });
+      github = new GitHubAdapter(auth, webhookSecret, lockManager, botMention, {
+        getUserToken,
+        ambientReview: config.ambientReview,
+      });
       await github.start();
       activePlatforms.push('GitHub (App)');
       getLog().info(
@@ -470,7 +473,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       const botMention =
         process.env.GITHUB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
       const auth: GitHubAuth = { kind: 'pat', token: patToken };
-      github = new GitHubAdapter(auth, webhookSecret, lockManager, botMention);
+      github = new GitHubAdapter(auth, webhookSecret, lockManager, botMention, {
+        ambientReview: config.ambientReview,
+      });
       await github.start();
       activePlatforms.push('GitHub');
       getLog().info('github.adapter_mode_pat');
