@@ -1,0 +1,472 @@
+name: archon-fix-github-issue-routed
+description: |
+  EXPERIMENTAL (cross-model + memory): the Opus-plans / Kimi-codes + persistent
+  cross-run memory variant of archon-fix-github-issue. Same DAG shape as the
+  default — same nodes, dependencies, command files, gates — with two grafts from
+  the operator's terminal Claude Code harness:
+
+  1. MODEL ROUTING (Opus decides, Kimi edits, Opus reviews):
+     - Workflow default stays Claude (classify/research/review/report run on Claude).
+     - The reasoning nodes (investigate, plan) are pinned to model: large (Opus tier).
+     - ONLY the two code-WRITING nodes (implement, self-fix) are routed to Kimi via
+       the pi provider (provider: pi, model: kimi-coding/kimi-for-coding). The
+       simplify node stays on Claude (it is a small quality/altitude pass, not bulk
+       code-writing).
+
+  2. PERSISTENT CROSS-RUN MEMORY:
+     - load-memory (first node) reads .archon/issue-fix-memory.json and feeds prior
+       fixes/patterns into the classifier so past work informs the run.
+     - save-memory (last node) records this issue under resolved_issues and writes
+       the file back. Survives across separate runs on the same worktree (unlike
+       $ARTIFACTS_DIR, which is per-run). The file is gitignored / worktree-local.
+
+  Run via the headless CLI, not the dashboard — pi/Kimi nodes zombie on the Windows
+  dashboard (Bash tool-result delivery hangs). Requires `pi /login` -> Kimi For
+  Coding (auth.json); do NOT put KIMI_API_KEY in ~/.archon/.env (override:true
+  force-injects a stale key -> 401).
+
+  Use when: User wants to FIX/RESOLVE/IMPLEMENT a GitHub issue with Opus planning +
+  Kimi coding and cross-run memory.
+  Triggers: "fix this issue with kimi", "fix it opus-plan kimi-code", "routed fix".
+  NOT for: Comprehensive multi-agent reviews (use archon-issue-review-full),
+           questions about issues, CI failures, PR reviews, general exploration.
+
+provider: claude
+model: medium
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: LOAD CROSS-RUN MEMORY
+  # Reads .archon/issue-fix-memory.json (created on first run). Persists
+  # across separate runs on the same worktree — unlike $ARTIFACTS_DIR.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: load-memory
+    runtime: bun
+    timeout: 5000
+    script: |
+      import { existsSync, readFileSync } from 'node:fs';
+      import { resolve } from 'node:path';
+
+      const memoryPath = resolve(process.cwd(), '.archon/issue-fix-memory.json');
+      let memory = { resolved_issues: {}, patterns: {} };
+
+      if (existsSync(memoryPath)) {
+        try {
+          memory = JSON.parse(readFileSync(memoryPath, 'utf8'));
+        } catch {
+          memory = { resolved_issues: {}, patterns: {} };
+        }
+      }
+
+      console.log(JSON.stringify(memory, null, 2));
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-number
+    prompt: |
+      Find the GitHub issue number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit issue number (e.g., "#709", "issue 709", "709"), extract that number.
+      - If the message is ambiguous (e.g., "fix the SQLite timestamp bug"), use `gh issue list` to search for matching issues and pick the best match.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation. Example correct output: 709
+
+  - id: fetch-issue
+    bash: |
+      # Strip quotes, whitespace, markdown backticks from AI output.
+      # Archon injects node-output refs already shell-quoted — assign unquoted,
+      # then sanitize. Double-quoting one here would yield the wrong value.
+      # (Do not write a literal node-output token in a comment: Archon
+      # substitutes magic tokens inside comments too, and an unknown node id
+      # there emits a spurious dag_node_output_ref_unknown_node warning.)
+      ISSUE_RAW=$extract-issue-number.output
+      ISSUE_NUM=$(echo "$ISSUE_RAW" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number from: $ISSUE_RAW" >&2
+        exit 1
+      fi
+      gh issue view "$ISSUE_NUM" --json title,body,labels,comments,state,url,author
+    depends_on: [extract-issue-number]
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the GitHub issue below and determine its type.
+
+      ## Prior fixes (memory)
+
+      The following is what past runs of this workflow have resolved in this repo.
+      Use it as context — if this issue resembles a prior fix or a recurring pattern,
+      note that in your reasoning so downstream planning can reuse the approach.
+
+      $load-memory.output
+
+      ## Issue Content
+
+      $fetch-issue.output
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | "broken", "error", "crash", "doesn't work", stack traces, regression |
+      | feature | "add", "new", "support", "would be nice", net-new capability |
+      | enhancement | "improve", "better", "update existing", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | "update deps", "upgrade", "maintenance", "CI/CD" |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-issue, load-memory]
+    model: small
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # Persist issue number + type to disk so the save-memory bun node can read
+  # them via $ARTIFACTS_DIR (the proven maintainer-review-pr pattern) instead of
+  # relying on $node.output substitution semantics inside a script node.
+  - id: persist-meta
+    bash: |
+      mkdir -p "$ARTIFACTS_DIR"
+      ISSUE_RAW=$extract-issue-number.output
+      ISSUE_NUM=$(echo "$ISSUE_RAW" | grep -oE '[0-9]+' | head -1)
+      echo "$ISSUE_NUM" > "$ARTIFACTS_DIR/.issue-number"
+      TYPE=$classify.output.issue_type
+      echo "$TYPE" > "$ARTIFACTS_DIR/.issue-type"
+    depends_on: [classify]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH (parallel with PR template fetch)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
+  # Pinned to model: large (Opus tier) — this is the reasoning that decides
+  # WHAT Kimi will implement. Opus plans; Kimi codes.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    command: archon-investigate-issue
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+    provider: claude
+    model: large
+
+  - id: plan
+    command: archon-create-plan
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+    provider: claude
+    model: large
+
+  # Bridge: ensure investigation.md exists for the implement step
+  # archon-fix-issue reads from $ARTIFACTS_DIR/investigation.md
+  # archon-create-plan writes to $ARTIFACTS_DIR/plan.md
+  # This node copies plan.md → investigation.md when the plan path was taken
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md to investigation.md for implement step"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists from investigate step"
+      else
+        echo "WARNING: No investigation.md or plan.md found — implement may fail"
+      fi
+    depends_on: [investigate, plan]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: IMPLEMENT  (Kimi codes)
+  # Routed to the pi provider / Kimi For Coding. Opus already decided what to
+  # change in investigate/plan; Kimi makes the edits.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    command: archon-fix-issue
+    depends_on: [bridge-artifacts]
+    context: fresh
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    allowed_tools: [Read, Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: CREATE DRAFT PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a draft pull request for the current branch.
+
+      ## Context
+
+      - **Issue**: $ARGUMENTS
+      - **Classification**: $classify.output
+      - **Issue title**: $classify.output.title
+
+      ## Instructions
+
+      1. Check git status. If uncommitted changes exist, stage and commit ONLY source files that are part of the fix:
+         - List them by name with `git add <path1> <path2> ...` — never `git add -A`, `git add .`, or `git add -u`
+         - **Never commit** scratch / review / PR-body artifacts, even if they appear in `git status`:
+           - `.pr-body.md`, `pr-body.md`, `*.scratch.md`, `*.tmp.md` at any path
+           - `review/`, `*-report.md` at the repo root
+           - Anything under `$ARTIFACTS_DIR`
+         - Verify with `git status --porcelain` that nothing scratch is staged before committing
+         - If files you don't recognize as part of the fix appear modified or untracked, leave them alone
+      2. Push the branch: `git push -u origin HEAD`
+      3. Read implementation artifacts from `$ARTIFACTS_DIR/` for context:
+         - `$ARTIFACTS_DIR/investigation.md` or `$ARTIFACTS_DIR/plan.md`
+         - `$ARTIFACTS_DIR/implementation.md`
+         - `$ARTIFACTS_DIR/validation.md`
+      4. Check if a PR already exists for this branch: `gh pr list --head $(git branch --show-current)`
+         - If PR exists, skip creation and capture its number
+      5. Look for the project's PR template at `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`. Read whichever one exists.
+      6. Create a DRAFT PR: `gh pr create --draft --base $BASE_BRANCH`
+         - Title: concise, imperative mood, under 70 chars
+         - Body: if a PR template was found, fill in **every section** with details from the artifacts. Don't skip sections or leave placeholders. If no template, write a body with summary, changes, validation evidence, and `Fixes #...`.
+         - **PR body file location**: if you write the body to a file (e.g. for `--body-file`), the file MUST live at `$ARTIFACTS_DIR/pr-body.md` or under `/tmp/` — NEVER inside the worktree. Files like `.pr-body.md` at the repo root will be picked up by later commits.
+         - Link to issue: include `Fixes #...` or `Closes #...`
+      7. Capture PR identifiers:
+         ```bash
+         HEAD_BRANCH=$(git branch --show-current)
+         PR_NUMBER=$(gh pr list --head "$HEAD_BRANCH" --state open --json number -q '.[0].number')
+         if [ -z "$PR_NUMBER" ]; then
+           echo "No open PR found for branch $HEAD_BRANCH — PR creation failed" >&2
+           exit 1
+         fi
+         echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+         PR_URL=$(gh pr view "$PR_NUMBER" --json url -q '.url')
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+    depends_on: [validate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: REVIEW  (Opus reviews what Kimi wrote)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      HEAD_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      PR_NUMBER=$(gh pr list --head "$HEAD_BRANCH" --state open --json number -q '.[0].number')
+      if [ -z "$PR_NUMBER" ]; then
+        echo "No open PR found for branch $HEAD_BRANCH" >&2
+        exit 1
+      fi
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        echo "Base mismatch on PR #$PR_NUMBER: expected=$EXPECTED actual=$ACTUAL — re-targeting" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR base verified: $EXPECTED"
+      fi
+    depends_on: [create-pr]
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [verify-pr-base]
+    context: fresh
+
+  - id: review-classify
+    prompt: |
+      You are a PR review classifier. Analyze the PR scope and determine
+      which review agents should run.
+
+      ## PR Scope
+
+      $review-scope.output
+
+      ## Rules
+
+      - **Code review**: ALWAYS run. This is mandatory for every PR. It also checks
+        the PR against CLAUDE.md rules and project conventions.
+      - **Error handling**: Run if the diff touches code with try/catch, error handling,
+        async/await, or adds new failure paths.
+      - **Test coverage**: Run if the diff touches source code (not just tests, docs, or config).
+      - **Comment quality**: Run if the diff adds or modifies comments, docstrings, JSDoc,
+        or significant documentation within code files.
+      - **Docs impact**: Run if the diff adds/removes/renames public APIs, commands, CLI flags,
+        environment variables, or user-facing features.
+
+      Provide your reasoning for each decision.
+    depends_on: [review-scope]
+    model: small
+    allowed_tools: []
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        run_code_review:
+          type: string
+          enum: ["true", "false"]
+        run_error_handling:
+          type: string
+          enum: ["true", "false"]
+        run_test_coverage:
+          type: string
+          enum: ["true", "false"]
+        run_comment_quality:
+          type: string
+          enum: ["true", "false"]
+        run_docs_impact:
+          type: string
+          enum: ["true", "false"]
+        reasoning:
+          type: string
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - reasoning
+
+  # Code review always runs — mandatory
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [review-classify]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_error_handling == 'true'"
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_test_coverage == 'true'"
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_comment_quality == 'true'"
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_docs_impact == 'true'"
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8: SYNTHESIZE + SELF-FIX  (Kimi applies the fixes)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  - id: self-fix
+    command: archon-self-fix-all
+    depends_on: [synthesize]
+    context: fresh
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    allowed_tools: [Read, Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 9: SIMPLIFY  (stays on Claude — quality/altitude pass)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 10: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-issue-completion-report
+    depends_on: [simplify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 11: SAVE CROSS-RUN MEMORY
+  # Records this issue under resolved_issues and writes the file back so the
+  # next run's load-memory sees it. Worktree-local; gitignored.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: save-memory
+    runtime: bun
+    timeout: 5000
+    depends_on: [report, persist-meta]
+    script: |
+      import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+      import { resolve } from 'node:path';
+
+      const baseDir = resolve(process.cwd(), '.archon');
+      if (!existsSync(baseDir)) mkdirSync(baseDir, { recursive: true });
+
+      const memoryPath = resolve(baseDir, 'issue-fix-memory.json');
+      let memory = { resolved_issues: {}, patterns: {} };
+      if (existsSync(memoryPath)) {
+        try {
+          memory = JSON.parse(readFileSync(memoryPath, 'utf8'));
+        } catch {
+          memory = { resolved_issues: {}, patterns: {} };
+        }
+      }
+
+      // Read issue number + type from the files persist-meta wrote, via
+      // $ARTIFACTS_DIR (same mechanism as maintainer-review-pr) — NOT from
+      // per-node .output substitution, whose quoting inside a script node is
+      // unproven. (Do NOT write the literal per-node output token here: the
+      // loader scans script bodies for it and rejects it as an unknown node.)
+      let issueNum = 'unknown';
+      let classification = 'unknown';
+      try {
+        issueNum = readFileSync(resolve(process.cwd(), '$ARTIFACTS_DIR/.issue-number'), 'utf8').trim() || 'unknown';
+      } catch {}
+      try {
+        classification = readFileSync(resolve(process.cwd(), '$ARTIFACTS_DIR/.issue-type'), 'utf8').trim() || 'unknown';
+      } catch {}
+
+      memory.resolved_issues[issueNum] = {
+        fixed_at: new Date().toISOString(),
+        classification,
+        run_id: '$WORKFLOW_ID',
+      };
+
+      writeFileSync(memoryPath, JSON.stringify(memory, null, 2) + '\n');
+      console.log(`Saved memory for issue #${issueNum}`);
