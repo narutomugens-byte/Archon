@@ -1,0 +1,40 @@
+name: archon-dod-gate
+description: |
+  Use when: You want to prove a change is actually DONE before it is pushed,
+            merged, or handed back — without reading the diff yourself.
+  Triggers: "/dod-gate", "gate this", "is this really done", "verify done".
+  Does: Runs the Definition-of-Done gate — a deterministic, LLM-free terminal
+        verifier. It re-executes the acceptance checks itself (never trusting an
+        agent's "tests pass" claim), then runs a revert-probe that strips the
+        implementation and re-runs the tests: if nothing flips red, the tests are
+        vacuous and the gate FAILs. Writes a plain-English verdict to
+        $ARTIFACTS_DIR/dod/verdict.{json,md} and exits non-zero on FAIL.
+  NOT for: Fixing the code (it only reports), judging code style or design
+           quality (no LLM is involved in the decision), or gating a change with
+           no acceptance spec — a missing spec is a FAIL, never a pass.
+
+  The acceptance spec is resolved from $DOD_SPEC (a .json file), or
+  .archon/dod/$DOD_TASK.json, or a `## Validation Commands` section in
+  $ARTIFACTS_DIR/plan.md. JSON is the canonical spec format.
+
+  Primary use is as a TERMINAL node appended to a build workflow: put this node
+  ahead of any push / PR-open / finalize node. Because a script node that exits
+  non-zero fails the node, downstream nodes with the default
+  `trigger_rule: all_success` are skipped automatically — that is the hard stop.
+
+provider: claude
+
+worktree:
+  enabled: false # gates the checkout it is pointed at; inherits the caller's worktree when appended
+
+# mutates_checkout is intentionally left at its default (true). The revert-probe
+# temporarily rewrites tracked files in the working tree and restores them, so two
+# concurrent runs on the same path would corrupt each other. The path-exclusive
+# lock must stay on.
+
+nodes:
+  - id: dod-gate
+    script: dod-gate # named script -> .archon/scripts/dod-gate.ts (never inline: a
+    # multi-line inline script truncates at the first newline on Windows)
+    runtime: bun
+    timeout: 600000 # outer backstop; the script also caps every command it spawns
