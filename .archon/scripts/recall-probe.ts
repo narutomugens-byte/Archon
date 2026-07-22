@@ -110,7 +110,15 @@ function probeOnce(c: RecallCase, runIdx: number): { fired: boolean; detail: str
     if (res.error) {
       return { fired: false, detail: `session failed to run: ${res.error.message}` };
     }
-    if (res.status !== 0) {
+    // `claude -p` also exits non-zero when it merely runs out of turn budget. That is
+    // NOT a broken session: the stream-json is complete up to the cutoff, so the
+    // recall evidence in it is real and MUST still be scored. Discarding it made the
+    // worktree-parallel case structurally unable to ever fire — the agent recalled the
+    // rule correctly and then spent its turns acting on it, which read as 0% recall
+    // (verified 2026-07-23). Same class as the A2 gate's `unavailable-no-deps` fix:
+    // separate "budget exhausted" from "genuinely failed".
+    const hitTurnBudget = /"subtype"\s*:\s*"error_max_turns"/.test(transcript);
+    if (res.status !== 0 && !hitTurnBudget) {
       // A session that errored (rate limit, crash, timeout) after emitting partial
       // stream-json must not be scored on that truncated output — it is not a
       // valid recall data point.
@@ -118,9 +126,10 @@ function probeOnce(c: RecallCase, runIdx: number): { fired: boolean; detail: str
     }
     const missing = c.evidence.filter((e) => !compileProbe(e).test(transcript));
     const violated = c.forbidden.filter((f) => compileProbe(f).test(transcript));
-    if (violated.length > 0) return { fired: false, detail: `forbidden matched: ${violated[0]}` };
-    if (missing.length > 0) return { fired: false, detail: `evidence missing: ${missing[0]}` };
-    return { fired: true, detail: 'ok' };
+    const budgetNote = hitTurnBudget ? ' (hit max_turns — scored on the complete-up-to-cutoff transcript)' : '';
+    if (violated.length > 0) return { fired: false, detail: `forbidden matched: ${violated[0]}${budgetNote}` };
+    if (missing.length > 0) return { fired: false, detail: `evidence missing: ${missing[0]}${budgetNote}` };
+    return { fired: true, detail: `ok${budgetNote}` };
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
   }
