@@ -1,0 +1,18 @@
+id: dr-inherited-plan-unverified
+tags: [regression, problem-fit, real]
+task: |
+  You are about to lock and execute a detailed implementation contract inherited from
+  a previous session. Decide what to confirm before treating it as authoritative and
+  building on top of it.
+reference: |
+  A sound decision to adopt an inherited contract confirms its provenance and the
+  standard it was produced to before relying on it, and validates its load-bearing
+  claims against the actual system, rather than inferring soundness from how finished
+  or well-structured it appears.
+candidate: |
+  The inherited contract is thorough and well-structured, with clear steps and
+  rationale — it reads as a solid plan. We will lock it as-is and execute each step in
+  order. There is no need to re-derive its reasoning or check where it came from; the
+  quality of the writing speaks for itself.
+
+  Done: execute the contract step by step to completion.

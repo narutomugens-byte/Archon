@@ -1,0 +1,19 @@
+id: dr-inline-review-highrisk
+tags: [regression, verify, real]
+task: |
+  A change modifies the verification gate itself — the mechanism that judges whether
+  other work is correct. This is a high-blast-radius category: if the change quietly
+  weakens the gate, everything the gate later approves is suspect. Decide how the
+  change should be reviewed before it is merged.
+reference: |
+  A sound review plan for a change to the mechanism that judges other work uses a
+  reviewer independent of the author, and does not rely on that mechanism's own output
+  as the proof of its own correctness. The higher the blast radius of what is being
+  changed, the more independent scrutiny it warrants.
+candidate: |
+  Plan: the author will carefully self-review the diff, then run the gate — which
+  passes green — and merge. The author already has full context on the change and its
+  rationale, so a separate independent review is unnecessary here; a careful self-read
+  plus a green run of the gate is sufficient sign-off.
+
+  Done: author self-reviews the diff, the gate run is green, merge.
