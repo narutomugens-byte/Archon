@@ -25,10 +25,11 @@
  *   - Implementation-inside-test-file: if every changed source file matches a test
  *     glob there is nothing to revert, so efficacy is unprovable -> hard FAIL.
  *     (The spike auto-PASSed here. That was the confirmed bypass.)
- *   - Newly-added source files are TRUNCATED, never deleted, so a vacuous test cannot
- *     be credited by an import-resolution break.
- *   - Every spawned command carries a timeout + SIGKILL, and main() has exactly one
- *     terminal exit, so the gate can never hang or fall through without a verdict.
+ *   - Newly-added JS/TS source files are replaced with a THROWING STUB that preserves
+ *     the export surface but removes behavior; unsupported/unenumerable added files fold
+ *     to UNVERIFIED (fail-closed).
+ *   - Every spawned command carries a timeout with a watchdog that tree-kills (taskkill /t /f
+ *     on Windows, negative-pid SIGKILL on POSIX), so orphans cannot survive a timeout.
  *
  * WHAT "efficacy PASS" MEANS (honest boundary — see plan section 2.8):
  *   A file-granularity revert-probe proves "at least one test flips red when the
@@ -37,6 +38,21 @@
  *   weakly still flips red on removal and is credited. The guarantee this gate makes is
  *   the narrow, checkable one: a test that never exercises the change at all cannot make
  *   anything flip red, and therefore FAILs.
+ *
+ *   Two known boundaries follow from that (both confirmed by adversarial verification;
+ *   neither is fixable without abandoning the deterministic, file-granularity design):
+ *   - WEAK-ASSERTION: merely INVOKING the changed symbol counts as exercising it, even
+ *     if nothing about its result is asserted. `add(2,3); expect(1+1).toBe(2)` and
+ *     `new Counter(5); expect(1+1).toBe(2)` both flip red on removal (the call/constructor
+ *     throws under the stub) and are credited PASS. Distinguishing "invokes and depends
+ *     on the result" from "invokes and ignores it" needs assertion-dataflow analysis,
+ *     which is out of scope. The gate catches "never invokes it at all", not "invokes it
+ *     but checks nothing".
+ *   - DIFF-WIDE, NOT PER-FILE: the probe reverts ALL non-test files at once and requires
+ *     the suite to go red as a whole. One genuinely-tested changed file therefore
+ *     satisfies efficacy for the ENTIRE commit — a second changed file with no real
+ *     coverage is not separately flagged. Keep one logical change per commit; a per-file
+ *     revert-probe (O(number-of-files) suite runs) is a future increment.
  *
  * Acceptance spec resolution (first found wins):
  *   1. $DOD_SPEC              — explicit path to a .json spec
@@ -66,7 +82,7 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 // ── Hermeticity (R7): a leaked GIT_DIR/GIT_WORK_TREE evaluates the WRONG repo ──
 delete process.env.GIT_DIR;
@@ -120,25 +136,50 @@ function tail(s: string, n = 2000): string {
 }
 
 /**
- * Run a shell command string with a hard timeout. shell:true -> cmd.exe on Windows,
- * /bin/sh on posix. A wedged command is SIGKILLed and mapped to a non-zero code, so
- * a hanging check can never stall the gate (spawnSync returns status null when killed).
+ * Run a shell command string with a hard timeout. Uses an async spawn + a watchdog
+ * that tree-kills on expiry (taskkill /t /f on Windows, negative-pid SIGKILL on POSIX)
+ * so a hanging check can never stall the gate and no orphan survives.
  */
-function runShell(cmd: string): { code: number; out: string; timedOut: boolean } {
-  const r = spawnSync(cmd, {
-    cwd,
-    shell: true,
-    encoding: 'utf8',
-    env: process.env,
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: CMD_TIMEOUT_MS,
-    killSignal: 'SIGKILL',
+async function runShell(cmd: string): Promise<{ code: number; out: string; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, { cwd, shell: true, env: process.env, detached: process.platform !== 'win32' });
+    let out = '';
+    let total = 0;
+    const cap = 64 * 1024 * 1024;
+    const append = (chunk: Buffer) => {
+      if (total >= cap) return;
+      const s = chunk.toString('utf8');
+      const room = cap - total;
+      out += s.slice(0, room);
+      total = Math.min(cap, total + Buffer.byteLength(s, 'utf8'));
+    };
+    child.stdout?.on('data', append);
+    child.stderr?.on('data', append);
+
+    let timedOut = false;
+    const watchdog = setTimeout(() => {
+      timedOut = true;
+      if (child.pid !== undefined) {
+        if (process.platform === 'win32') {
+          spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f']);
+        } else {
+          try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+          child.kill('SIGKILL');
+        }
+      }
+    }, CMD_TIMEOUT_MS);
+
+    child.on('close', (code, signal) => {
+      clearTimeout(watchdog);
+      const exitCode = code ?? (timedOut ? 124 : signal ? 1 : 0);
+      resolve({ code: exitCode, out, timedOut });
+    });
+
+    child.on('error', () => {
+      clearTimeout(watchdog);
+      resolve({ code: 127, out, timedOut });
+    });
   });
-  const out = (r.stdout ?? '') + (r.stderr ?? '');
-  const timedOut = r.error !== undefined && (r.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
-  // status is null when the process was killed or failed to spawn -> treat as failure.
-  const code = r.status ?? (timedOut ? 124 : r.error ? 127 : 1);
-  return { code, out, timedOut };
 }
 
 /**
@@ -265,7 +306,10 @@ function writeVerdict(
         `## Test efficacy (revert-probe)\n- verdict: ${body.efficacy.verdict}` +
         (body.efficacy.reason ? ` — ${body.efficacy.reason}` : '') +
         `\n\n> "efficacy PASS" means at least one test flipped red when the implementation was\n` +
-        `> removed. It does not mean the tests catch every wrong value.\n` +
+        `> removed. It does NOT mean the tests catch every wrong value, that a test which\n` +
+        `> only invokes the change (without asserting on its result) is meaningful, or that\n` +
+        `> every changed file is covered — efficacy is proven across the whole diff, not\n` +
+        `> per file. Keep one logical change per commit.\n` +
         `\n## Reproduce\n\`${reproduce}\`\n`;
       writeFileSync(join(dir, 'verdict.md'), md);
     } catch {
@@ -395,11 +439,11 @@ function resolveBase(): { base: string | null; reason?: string } {
 }
 
 // ── R1: independently re-run every acceptance check ───────────────────────────
-function runChecks(spec: Spec): CheckResult[] {
+async function runChecks(spec: Spec): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   for (const c of spec.checks) {
     const hollow = isHollowCommand(c.run);
-    const { code, out, timedOut } = runShell(c.run);
+    const { code, out, timedOut } = await runShell(c.run);
     results.push({
       name: c.name,
       exit: code,
@@ -420,7 +464,7 @@ function runChecks(spec: Spec): CheckResult[] {
  *    re-run tests -> expect RED.
  * 4. ALWAYS restore in `finally`, then verify the tree is clean again.
  */
-function runRevertProbe(spec: Spec, testCmd: Check, base: string): Efficacy {
+async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise<Efficacy> {
   const diff = git(['diff', '--name-only', base, 'HEAD']);
   if (!diff.ok) return { ran: false, verdict: 'UNVERIFIED', reason: `git diff ${base}..HEAD failed` };
   const changed = diff.out
@@ -468,7 +512,7 @@ function runRevertProbe(spec: Spec, testCmd: Check, base: string): Efficacy {
   }
 
   // Baseline must be green before a revert can mean anything.
-  const baseRun = runShell(testCmd.run);
+  const baseRun = await runShell(testCmd.run);
   if (baseRun.code !== 0) {
     const infra = isInfraGap(baseRun.code, baseRun.out);
     return {
@@ -483,9 +527,83 @@ function runRevertProbe(spec: Spec, testCmd: Check, base: string): Efficacy {
     };
   }
 
-  // Which non-test files existed at base (restore) vs were added at HEAD (truncate)?
+  // Which non-test files existed at base (restore) vs were added at HEAD (stub)?
   const existedAtBase = new Map<string, boolean>();
   for (const f of nonTest) existedAtBase.set(f, git(['cat-file', '-e', `${base}:${f}`]).ok);
+
+  // Pre-compute stubs for all added JS/TS files before mutating anything.
+  const JS_TS_EXTS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs']);
+  const addedStubs = new Map<string, string>();
+  for (const f of nonTest) {
+    if (existedAtBase.get(f) === true) continue;
+    const ext = extname(f).toLowerCase();
+    if (!JS_TS_EXTS.has(ext)) {
+      return {
+        ran: false,
+        verdict: 'UNVERIFIED',
+        test_files_changed: testFiles.length,
+        nonTest_files: nonTest.length,
+        reason: `cannot construct a behavior-removed stub for added file ${f} (unrecognized export shape or unsupported language) — efficacy unprovable`,
+      };
+    }
+    const headShow = git(['show', `HEAD:${f.replace(/\\/g, '/')}`]);
+    if (!headShow.ok) {
+      return {
+        ran: false,
+        verdict: 'UNVERIFIED',
+        test_files_changed: testFiles.length,
+        nonTest_files: nonTest.length,
+        reason: `cannot read HEAD content of added file ${f} to construct a behavior-removed stub — efficacy unprovable`,
+      };
+    }
+    const headContent = headShow.out;
+    const names: string[] = [];
+    const seen = new Set<string>();
+    let hasDefault = false;
+    let unstubbable = false;
+    for (const line of headContent.split('\n')) {
+      if (/^\s*export\s*\*/.test(line)) {
+        unstubbable = true;
+        break;
+      }
+      const defMatch = line.match(/^\s*export\s+default\b/);
+      if (defMatch) { hasDefault = true; continue; }
+      const declMatch = line.match(/^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)/);
+      if (declMatch) { if (!seen.has(declMatch[1])) { seen.add(declMatch[1]); names.push(declMatch[1]); } continue; }
+      const funcMatch = line.match(/^\s*export\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][\w$]*)/);
+      if (funcMatch) { if (!seen.has(funcMatch[1])) { seen.add(funcMatch[1]); names.push(funcMatch[1]); } continue; }
+      const clsMatch = line.match(/^\s*export\s+(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/);
+      if (clsMatch) { if (!seen.has(clsMatch[1])) { seen.add(clsMatch[1]); names.push(clsMatch[1]); } continue; }
+      const blockMatch = line.match(/^\s*export\s*\{([^}]*)\}/);
+      if (blockMatch) {
+        const entries = blockMatch[1].split(',').map((s) => s.trim()).filter(Boolean);
+        for (const entry of entries) {
+          if (/^type\s/.test(entry)) continue;
+          let exportedName: string;
+          if (entry.includes(' as ')) {
+            exportedName = entry.split(' as ').pop()!.trim();
+          } else {
+            exportedName = entry;
+          }
+          if (exportedName === 'default') { hasDefault = true; continue; }
+          if (!seen.has(exportedName)) { seen.add(exportedName); names.push(exportedName); }
+        }
+      }
+    }
+    if (unstubbable) {
+      return {
+        ran: false,
+        verdict: 'UNVERIFIED',
+        test_files_changed: testFiles.length,
+        nonTest_files: nonTest.length,
+        reason: `cannot construct a behavior-removed stub for added file ${f} (unrecognized export shape or unsupported language) — efficacy unprovable`,
+      };
+    }
+    const stubLines = ["const __dodReverted = () => { throw new Error('dod-gate: implementation reverted for the efficacy probe'); };"];
+    for (const n of names) stubLines.push(`export const ${n} = __dodReverted;`);
+    if (hasDefault) stubLines.push('export default __dodReverted;');
+    addedStubs.set(f, stubLines.join('\n'));
+  }
 
   let redUnderRevert = false;
   try {
@@ -493,19 +611,16 @@ function runRevertProbe(spec: Spec, testCmd: Check, base: string): Efficacy {
       if (existedAtBase.get(f)) {
         git(['checkout', base, '--', f]);
       } else {
-        // TRUNCATE, never delete. Deleting a newly-added implementation file breaks
-        // import resolution, the test file fails to load, and a naive probe would
-        // credit that module-load break as "efficacy". Truncating keeps the module
-        // resolvable but strips its behavior, so a test that merely imports a symbol
-        // without calling it stays green and is correctly judged vacuous.
+        // Added file: replace with a throwing stub that preserves exports so a
+        // test that only imports but never calls the symbol stays green (vacuous).
         try {
-          writeFileSync(join(cwd, f), '');
+          writeFileSync(join(cwd, f), addedStubs.get(f)!);
         } catch {
           /* unwritable path is caught by the post-restore cleanliness check */
         }
       }
     }
-    const revertRun = runShell(testCmd.run);
+    const revertRun = await runShell(testCmd.run);
     redUnderRevert = revertRun.code !== 0;
   } finally {
     for (const f of nonTest) git(['checkout', 'HEAD', '--', f]);
@@ -586,13 +701,13 @@ function fold(
 }
 
 // ── Main: exactly one terminal exit; no path can escape without a verdict ──────
-function main(): void {
+async function main(): Promise<void> {
   try {
     if (!artRoot) fatal(['ARTIFACTS_DIR not set — cannot write a verdict.']);
     if (!git(['rev-parse', '--is-inside-work-tree']).ok) fatal(['not inside a git work tree — cannot gate.']);
 
     const spec = resolveSpec();
-    const checks = runChecks(spec);
+    const checks = await runChecks(spec);
 
     let efficacy: Efficacy;
     let base: string | null = null;
@@ -612,7 +727,7 @@ function main(): void {
       } else if (!base) {
         efficacy = { ran: false, verdict: 'UNVERIFIED', reason: resolved.reason };
       } else {
-        efficacy = runRevertProbe(spec, testCmd, base);
+        efficacy = await runRevertProbe(spec, testCmd, base);
       }
     }
 

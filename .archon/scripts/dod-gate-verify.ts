@@ -58,6 +58,11 @@ const VACUOUS_TEST_WITH_IMPORT =
   "import { test, expect } from 'bun:test';\n" +
   "import { add } from './math';\n" +
   "test('vacuous', () => { expect(1 + 1).toBe(2); });\n";
+const SKIP_VACUOUS_TEST =
+  "import { test, expect } from 'bun:test';\n" +
+  "import { add } from './math';\n" +
+  "test('unrelated dummy', () => { expect(1 + 1).toBe(2); });\n" +
+  "test.skip('add works (skipped)', () => { expect(add(2, 3)).toBe(5); });\n";
 
 const FIXTURES: Fixture[] = [
   {
@@ -160,6 +165,23 @@ const FIXTURES: Fixture[] = [
     expectGate: 'FAIL',
     expectExitZero: false,
     expectReason: 'implementation lives only in test file',
+  },
+  {
+    name: '8-skip-vacuous-added',
+    why: 'DEFECT1: added impl file + the only test that exercises it is test.skip; an unrelated test passes. Truncation miscredited the link-error as efficacy; the throwing stub must expose it as vacuous.',
+    base: { 'README.md': '# fixture\n' },
+    change: { 'math.ts': GOOD_IMPL, 'math.test.ts': SKIP_VACUOUS_TEST },
+    expectGate: 'FAIL',
+    expectExitZero: false,
+    expectReason: 'vacuous',
+  },
+  {
+    name: '9-skip-real-runs-added',
+    why: 'anti-over-correction: same added impl file but the meaningful test is NOT skipped — it calls add at runtime, so the throwing stub makes it RED. Must still PASS (the fix must not fail every added-file case).',
+    base: { 'README.md': '# fixture\n' },
+    change: { 'math.ts': GOOD_IMPL, 'math.test.ts': REAL_TEST },
+    expectGate: 'PASS',
+    expectExitZero: true,
   },
   {
     name: 'BareWT-missing-binary',
@@ -341,6 +363,70 @@ try {
   record('Term-hanging-check', false, `harness error: ${(e as Error).message}`);
 }
 
+// ── NoOrphan: after a timeout, the tree-kill must leave no surviving grandchild ──
+try {
+  const dir = makeRepo(
+    'no-orphan',
+    { 'README.md': '# fixture\n' },
+    { 'math.ts': GOOD_IMPL, 'math.test.ts': REAL_TEST }
+  );
+  writeFileSync(
+    join(dir, 'spec.json'),
+    JSON.stringify({
+      checks: [
+        { name: 'tests', run: 'bun test', is_test_command: true },
+        { name: 'hang', run: 'bun -e "/*DODORPHAN9137*/ while(true){}"' },
+      ],
+      test_globs: ['**/*.test.ts'],
+      require_test_efficacy: true,
+    })
+  );
+  const run = runGate(dir, {
+    DOD_SPEC: join(dir, 'spec.json').replace(/\\/g, '/'),
+    DOD_CMD_TIMEOUT_MS: '3000',
+  });
+
+  // Give the OS a moment to reap the killed tree, then count survivors by marker.
+  const countOrphans = (): number => {
+    if (process.platform === 'win32') {
+      const ps = spawnSync(
+        'powershell',
+        [
+          '-NoProfile',
+          '-Command',
+          "(Get-CimInstance Win32_Process -Filter \"Name='bun.exe'\" | Where-Object { $_.CommandLine -like '*DODORPHAN9137*' } | Measure-Object).Count",
+        ],
+        { encoding: 'utf8' }
+      );
+      return parseInt((ps.stdout ?? '').trim(), 10) || 0;
+    }
+    const pg = spawnSync('pgrep', ['-f', 'DODORPHAN9137'], { encoding: 'utf8' });
+    return (pg.stdout ?? '').trim() ? (pg.stdout ?? '').trim().split('\n').filter(Boolean).length : 0;
+  };
+
+  const orphans = countOrphans();
+  if (orphans > 0) {
+    // Cleanup so a failure here does not leak CPU-bound orphans out of the harness.
+    if (process.platform === 'win32') {
+      spawnSync('powershell', [
+        '-NoProfile',
+        '-Command',
+        "Get-CimInstance Win32_Process -Filter \"Name='bun.exe'\" | Where-Object { $_.CommandLine -like '*DODORPHAN9137*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+      ]);
+    } else {
+      spawnSync('pkill', ['-9', '-f', 'DODORPHAN9137']);
+    }
+  }
+  const ok = run.verdict?.gate === 'FAIL' && run.exit !== 0 && orphans === 0;
+  record(
+    'NoOrphan-after-timeout',
+    ok,
+    `exit=${run.exit} gate=${run.verdict?.gate ?? '(none)'} survivingOrphans=${orphans} (must be 0)`
+  );
+} catch (e) {
+  record('NoOrphan-after-timeout', false, `harness error: ${(e as Error).message}`);
+}
+
 // ── NoSpec: no resolvable acceptance spec is a FAIL, never a pass ────────────
 try {
   const dir = makeRepo('no-spec', { 'README.md': '# fixture\n' }, { 'math.ts': GOOD_IMPL, 'math.test.ts': REAL_TEST });
@@ -374,4 +460,5 @@ console.log(
     'downstream push node is skipped after a gate FAIL. The gate\'s non-zero exit (asserted above for\n' +
     'every FAIL case) is the mechanism, but the executor-level skip is not exercised here.'
 );
+console.log(`HARNESS_EXIT=${failed.length === 0 ? 0 : 1}`);
 process.exit(failed.length === 0 ? 0 : 1);
