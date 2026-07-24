@@ -64,6 +64,19 @@ const SKIP_VACUOUS_TEST =
   "test('unrelated dummy', () => { expect(1 + 1).toBe(2); });\n" +
   "test.skip('add works (skipped)', () => { expect(add(2, 3)).toBe(5); });\n";
 
+// Round-4 confirmed false-PASS shape: a long non-ASCII exported identifier. Defined once
+// so the impl file and both tests reference the byte-identical name (no drift).
+const UNICODE_LONG_NAME = '$_αβγΩ_veryLongIdentifierName_9876543210';
+const UNICODE_LONG_IMPL = `export const ${UNICODE_LONG_NAME} = 42;\n`;
+const UNICODE_LONG_VACUOUS_TEST =
+  "import { test, expect } from 'bun:test';\n" +
+  `import { ${UNICODE_LONG_NAME} } from './u';\n` +
+  `test('vacuous', () => { const _ = ${UNICODE_LONG_NAME}; expect(1 + 1).toBe(2); });\n`;
+const UNICODE_LONG_REAL_TEST =
+  "import { test, expect } from 'bun:test';\n" +
+  `import { ${UNICODE_LONG_NAME} } from './u';\n` +
+  `test('real', () => { expect(${UNICODE_LONG_NAME}).toBe(42); });\n`;
+
 const FIXTURES: Fixture[] = [
   {
     name: '1-good-change',
@@ -200,6 +213,118 @@ const FIXTURES: Fixture[] = [
     expectExitZero: false,
     expectReason: 'UNVERIFIED',
   },
+  {
+    name: 'enum-added-vacuous',
+    why: 'DEFECT1: added flags.ts = `export enum Mode`; test imports+references Mode but asserts only 1+1. The enum export must be stubbed (or fail-closed) so the vacuous test is caught, never miscredited via a link error.',
+    base: { 'README.md': '# fixture\n' },
+    change: {
+      'flags.ts': 'export enum Mode { A, B }\n',
+      'flags.test.ts':
+        "import { test, expect } from 'bun:test';\n" +
+        "import { Mode } from './flags';\n" +
+        "test('vacuous', () => { const _ = Mode; expect(1 + 1).toBe(2); });\n",
+    },
+    // reason may be `vacuous` OR the unrecognized-shape reason — either is an acceptable
+    // FAIL, so we assert only gate=FAIL + exit!=0 (NOT PASS), per spec.
+    expectGate: 'FAIL',
+    expectExitZero: false,
+  },
+  {
+    name: 'enum-added-real',
+    why: 'anti-over-correction: same added flags.ts, but the test depends on the enum value (expect(Mode.A).toBe(0)). Under the value-collapsed stub the assertion diverges -> RED -> correctly credited PASS. A genuine enum change must still pass.',
+    base: { 'README.md': '# fixture\n' },
+    change: {
+      'flags.ts': 'export enum Mode { A, B }\n',
+      'flags.test.ts':
+        "import { test, expect } from 'bun:test';\n" +
+        "import { Mode } from './flags';\n" +
+        "test('mode A is 0', () => { expect(Mode.A).toBe(0); });\n",
+    },
+    expectGate: 'PASS',
+    expectExitZero: true,
+  },
+  {
+    name: 'multi-declarator-added-vacuous',
+    why: 'DEFECT1: added k.ts = `export const a = 1, b = 2;`. The old parser collected only `a`; import { b } against a stub missing `b` was a link error miscredited as efficacy. Multi-declarator must collect every name so the vacuous test is caught.',
+    base: { 'README.md': '# fixture\n' },
+    change: {
+      'k.ts': 'export const a = 1, b = 2;\n',
+      'k.test.ts':
+        "import { test, expect } from 'bun:test';\n" +
+        "import { a, b } from './k';\n" +
+        "test('vacuous', () => { const _ = a + b; expect(1 + 1).toBe(2); });\n",
+    },
+    expectGate: 'FAIL',
+    expectExitZero: false,
+    expectReason: 'vacuous',
+  },
+  {
+    name: 'nonjs-added-failclosed',
+    why: 'surviving fail-closed net (v1.4): an ADDED non-test source file whose language is not JS/TS cannot be runtime-enumerated for its exports, so no behavior-removed stub can be built. Paired with a green test, efficacy is UNVERIFIED -> FAIL under strict — never a silent PASS. Runtime enumeration closed the source-text-shape class entirely; this proves the remaining fail-closed path (non-JS/TS or non-importable) still holds.',
+    base: { 'README.md': '# fixture\n' },
+    change: {
+      'impl.py': 'def foo():\n    return 1\n',
+      'stuff.test.ts':
+        "import { test, expect } from 'bun:test';\n" +
+        "test('unrelated but green', () => { expect(1 + 1).toBe(2); });\n",
+    },
+    expectGate: 'FAIL',
+    expectExitZero: false,
+    expectReason: 'unsupported language',
+  },
+  {
+    name: 'two-exports-one-line-vacuous',
+    why: 'F1 (CRITICAL false PASS): two export statements on ONE physical line ' +
+      '(`export function foo(){...} export const bar = 2;`). The line-oriented scanner ' +
+      'collected only `foo` and dropped `bar`, so the stub was missing `bar`; `import { bar }` ' +
+      'link-crashed under revert and the crash was miscredited as efficacy. Both exports must be ' +
+      'stubbed so a test that only references them as values stays green and is caught as vacuous.',
+    base: { 'README.md': '# fixture\n' },
+    change: {
+      'one.ts': 'export function foo() { return 1; } export const bar = 2;\n',
+      'one.test.ts':
+        "import { test, expect } from 'bun:test';\n" +
+        "import { foo, bar } from './one';\n" +
+        "test('vacuous', () => { const _ = foo; const __ = bar; expect(1 + 1).toBe(2); });\n",
+    },
+    expectGate: 'FAIL',
+    expectExitZero: false,
+    expectReason: 'vacuous',
+  },
+  {
+    name: 'two-exports-one-line-real',
+    why: 'anti-over-correction twin of two-exports-one-line-vacuous: same two-exports-on-one-line ' +
+      'shape, but the test actually calls foo() and depends on bar. Under the throwing stub foo() ' +
+      'throws -> RED -> correctly credited PASS. The fix must stub BOTH exports without fail-closing ' +
+      'every two-export-line case.',
+    base: { 'README.md': '# fixture\n' },
+    change: {
+      'one.ts': 'export function foo() { return 1; } export const bar = 2;\n',
+      'one.test.ts':
+        "import { test, expect } from 'bun:test';\n" +
+        "import { foo, bar } from './one';\n" +
+        "test('foo and bar', () => { expect(foo()).toBe(1); expect(bar).toBe(2); });\n",
+    },
+    expectGate: 'PASS',
+    expectExitZero: true,
+  },
+  {
+    name: 'unicode-long-vacuous',
+    why: 'ROUND-4 confirmed false PASS under the regex parser: an added file exporting a long non-ASCII identifier (`export const $_αβγΩ_veryLong… = 42;`). A regex length/codepoint bound mis-extracted the name, the stub omitted it, `import { name }` link-crashed under revert, and the crash was miscredited as efficacy. Runtime enumeration returns the exact name, the stub preserves it, and the vacuous test (references the value, asserts 1+1) stays green under revert -> correctly caught as vacuous.',
+    base: { 'README.md': '# fixture\n' },
+    change: { 'u.ts': UNICODE_LONG_IMPL, 'u.test.ts': UNICODE_LONG_VACUOUS_TEST },
+    expectGate: 'FAIL',
+    expectExitZero: false,
+    expectReason: 'vacuous',
+  },
+  {
+    name: 'unicode-long-real',
+    why: 'anti-over-correction twin: same added unicode-identifier file, but the test depends on the value (expect(name).toBe(42)). Under the value-collapsed throwing stub the assertion diverges -> RED -> correctly credited PASS. A genuine change on a unicode-named export must still pass.',
+    base: { 'README.md': '# fixture\n' },
+    change: { 'u.ts': UNICODE_LONG_IMPL, 'u.test.ts': UNICODE_LONG_REAL_TEST },
+    expectGate: 'PASS',
+    expectExitZero: true,
+  },
 ];
 
 // ── plumbing ──────────────────────────────────────────────────────────────────
@@ -309,6 +434,65 @@ for (const f of FIXTURES) {
   } catch (e) {
     record(f.name, false, `harness error: ${(e as Error).message}`);
   }
+}
+
+// ── DeletedFile-clean-tree (Defect 2): deleting a non-test source file must not leave
+//    the working tree dirty (no resurrected file staged as `A`, no stray `??`). ──
+try {
+  const dir = join(ROOT, 'deleted-nonTest-clean-tree').replace(/\\/g, '/');
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  sh('git', ['init', '--quiet'], dir);
+  sh('git', ['config', 'user.email', 'gate@example.test'], dir);
+  sh('git', ['config', 'user.name', 'Gate Fixture'], dir);
+  sh('git', ['config', 'commit.gpgsign', 'false'], dir);
+  // base commit: victim.ts (to be deleted) + math.ts (BASE_IMPL) + a real test that covers math.
+  writeFiles(dir, {
+    'victim.ts': 'export const victim = (): number => 42;\n',
+    'math.ts': BASE_IMPL,
+    'math.test.ts': REAL_TEST,
+  });
+  sh('git', ['add', '-A'], dir);
+  sh('git', ['commit', '--quiet', '-m', 'base'], dir);
+  // change commit: DELETE victim.ts and upgrade math.ts to the covered implementation.
+  // Modify the test file too, so the probe's `testFiles` is non-empty and the
+  // revert-probe actually runs — resurrecting victim.ts and exercising the
+  // finally-block `git rm` cleanup. Without a changed test file the gate
+  // short-circuits at "no test file changed" and never touches the tree,
+  // making this Defect-2 fixture vacuous.
+  rmSync(join(dir, 'victim.ts'), { force: true });
+  writeFiles(dir, {
+    'math.ts': GOOD_IMPL,
+    'math.test.ts': REAL_TEST + "test('add works 2', () => { expect(add(4, 5)).toBe(9); });\n",
+  });
+  sh('git', ['add', '-A'], dir);
+  sh('git', ['commit', '--quiet', '-m', 'delete victim + real change'], dir);
+
+  writeFileSync(join(dir, 'spec.json'), JSON.stringify(COMMON_SPEC, null, 2));
+  const run = runGate(dir, { DOD_SPEC: join(dir, 'spec.json').replace(/\\/g, '/') });
+
+  // The assertion: after the gate returns, the tree/index must be clean — victim.ts must
+  // NOT reappear as `A`/`??`. Gate verdict itself may be PASS or FAIL; we assert cleanliness.
+  const status = spawnSync('git', ['-c', 'core.autocrlf=false', 'status', '--porcelain'], {
+    cwd: dir,
+    encoding: 'utf8',
+  });
+  const dirty = (status.stdout ?? '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .filter((l) => !l.startsWith('??'))
+    .join(' / ');
+  const ok = dirty === '';
+  record(
+    'DeletedFile-clean-tree',
+    ok,
+    ok
+      ? `tree clean after gate (gate=${run.verdict?.gate ?? '(none)'} exit=${run.exit})`
+      : `tree left dirty after gate: "${dirty.replace(/\n/g, ' / ')}" (gate=${run.verdict?.gate ?? '(none)'})`
+  );
+} catch (e) {
+  record('DeletedFile-clean-tree', false, `harness error: ${(e as Error).message}`);
 }
 
 // ── Det: identical verdicts across 3 runs (ignoring the timestamp) ────────────

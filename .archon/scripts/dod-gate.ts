@@ -83,6 +83,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 // ── Hermeticity (R7): a leaked GIT_DIR/GIT_WORK_TREE evaluates the WRONG repo ──
 delete process.env.GIT_DIR;
@@ -465,7 +466,7 @@ async function runChecks(spec: Spec): Promise<CheckResult[]> {
  * 4. ALWAYS restore in `finally`, then verify the tree is clean again.
  */
 async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise<Efficacy> {
-  const diff = git(['diff', '--name-only', base, 'HEAD']);
+  const diff = git(['diff', '--no-renames', '--name-only', base, 'HEAD']);
   if (!diff.ok) return { ran: false, verdict: 'UNVERIFIED', reason: `git diff ${base}..HEAD failed` };
   const changed = diff.out
     .split('\n')
@@ -530,8 +531,19 @@ async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise
   // Which non-test files existed at base (restore) vs were added at HEAD (stub)?
   const existedAtBase = new Map<string, boolean>();
   for (const f of nonTest) existedAtBase.set(f, git(['cat-file', '-e', `${base}:${f}`]).ok);
+  const existsAtHead = new Map<string, boolean>();
+  for (const f of nonTest) existsAtHead.set(f, git(['cat-file', '-e', `HEAD:${f}`]).ok);
 
   // Pre-compute stubs for all added JS/TS files before mutating anything.
+  // v1.4: export names come from RUNTIME ENUMERATION of the real module at HEAD, not
+  // from parsing source text. The working tree currently equals HEAD (the change is
+  // committed and trackedDirty(nonTest) is already empty above), so the on-disk file IS
+  // the real module — importing it yields the exact runtime export surface for EVERY
+  // source shape (unicode, enum, multi-declarator, N-exports-per-line, destructured,
+  // re-export barrel) with zero text parsing. Enumerate BEFORE any revert mutation; the
+  // test command runs in a SEPARATE process, so the stub written to disk afterward cannot
+  // collide with this gate process's own module cache. Types are erased at runtime, which
+  // is correct — only VALUE exports need a stub.
   const JS_TS_EXTS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs']);
   const addedStubs = new Map<string, string>();
   for (const f of nonTest) {
@@ -543,64 +555,27 @@ async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise
         verdict: 'UNVERIFIED',
         test_files_changed: testFiles.length,
         nonTest_files: nonTest.length,
-        reason: `cannot construct a behavior-removed stub for added file ${f} (unrecognized export shape or unsupported language) — efficacy unprovable`,
+        reason: `cannot enumerate exports of added file ${f} (unsupported language — not JS/TS) — efficacy unprovable`,
       };
     }
-    const headShow = git(['show', `HEAD:${f.replace(/\\/g, '/')}`]);
-    if (!headShow.ok) {
+    let ns: Record<string, unknown>;
+    try {
+      // Import the real on-disk HEAD module to read its runtime export names.
+      ns = (await import(pathToFileURL(join(cwd, f)).href)) as Record<string, unknown>;
+    } catch {
       return {
         ran: false,
         verdict: 'UNVERIFIED',
         test_files_changed: testFiles.length,
         nonTest_files: nonTest.length,
-        reason: `cannot read HEAD content of added file ${f} to construct a behavior-removed stub — efficacy unprovable`,
+        reason: `cannot import added file ${f} at HEAD to enumerate its exports — efficacy unprovable`,
       };
     }
-    const headContent = headShow.out;
-    const names: string[] = [];
-    const seen = new Set<string>();
-    let hasDefault = false;
-    let unstubbable = false;
-    for (const line of headContent.split('\n')) {
-      if (/^\s*export\s*\*/.test(line)) {
-        unstubbable = true;
-        break;
-      }
-      const defMatch = line.match(/^\s*export\s+default\b/);
-      if (defMatch) { hasDefault = true; continue; }
-      const declMatch = line.match(/^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)/);
-      if (declMatch) { if (!seen.has(declMatch[1])) { seen.add(declMatch[1]); names.push(declMatch[1]); } continue; }
-      const funcMatch = line.match(/^\s*export\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][\w$]*)/);
-      if (funcMatch) { if (!seen.has(funcMatch[1])) { seen.add(funcMatch[1]); names.push(funcMatch[1]); } continue; }
-      const clsMatch = line.match(/^\s*export\s+(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/);
-      if (clsMatch) { if (!seen.has(clsMatch[1])) { seen.add(clsMatch[1]); names.push(clsMatch[1]); } continue; }
-      const blockMatch = line.match(/^\s*export\s*\{([^}]*)\}/);
-      if (blockMatch) {
-        const entries = blockMatch[1].split(',').map((s) => s.trim()).filter(Boolean);
-        for (const entry of entries) {
-          if (/^type\s/.test(entry)) continue;
-          let exportedName: string;
-          if (entry.includes(' as ')) {
-            exportedName = entry.split(' as ').pop()!.trim();
-          } else {
-            exportedName = entry;
-          }
-          if (exportedName === 'default') { hasDefault = true; continue; }
-          if (!seen.has(exportedName)) { seen.add(exportedName); names.push(exportedName); }
-        }
-      }
-    }
-    if (unstubbable) {
-      return {
-        ran: false,
-        verdict: 'UNVERIFIED',
-        test_files_changed: testFiles.length,
-        nonTest_files: nonTest.length,
-        reason: `cannot construct a behavior-removed stub for added file ${f} (unrecognized export shape or unsupported language) — efficacy unprovable`,
-      };
-    }
+    const keys = Object.keys(ns).sort(); // R6 determinism: stable stub surface
+    const hasDefault = keys.includes('default');
+    const names = keys.filter((k) => k !== 'default');
     const stubLines = ["const __dodReverted = () => { throw new Error('dod-gate: implementation reverted for the efficacy probe'); };"];
-    for (const n of names) stubLines.push(`export const ${n} = __dodReverted;`);
+    for (const n of names) stubLines.push(`export { __dodReverted as ${JSON.stringify(n)} };`);
     if (hasDefault) stubLines.push('export default __dodReverted;');
     addedStubs.set(f, stubLines.join('\n'));
   }
@@ -623,7 +598,16 @@ async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise
     const revertRun = await runShell(testCmd.run);
     redUnderRevert = revertRun.code !== 0;
   } finally {
-    for (const f of nonTest) git(['checkout', 'HEAD', '--', f]);
+    for (const f of nonTest) {
+      if (existsAtHead.get(f)) {
+        git(['checkout', 'HEAD', '--', f]); // present at HEAD -> restore committed content
+      } else {
+        // Deleted at HEAD but resurrected by the probe (it existed at base): return the
+        // tree to HEAD's "file absent" state instead of a checkout that fails on a path
+        // absent from HEAD and leaves it staged as `A`.
+        git(['rm', '-f', '--quiet', '--', f]);
+      }
+    }
   }
 
   const stillDirty = trackedDirty(nonTest);
