@@ -218,6 +218,15 @@ export const dagNodeBaseSchema = z.object({
   // programmatically by the orchestrator for prompt caching; Zod intentionally stays narrow.
   systemPrompt: z.string().min(1).optional(),
   fallbackModel: z.string().min(1).optional(),
+  // Engine-level cross-provider failover (distinct from `fallbackModel` above, which is
+  // a Claude-SDK-internal comma-list of Claude model ids re-tried inside the Claude
+  // subprocess). Same grammar as `model:` (tier/`@alias`/literal), resolved via
+  // resolveModelSpec at dispatch time. When a node fails with a fallback-eligible error
+  // (quota or output_format schema-miss) and `fallback:` is set, the executor
+  // re-dispatches the node ONCE on the resolved fallback provider before failing the
+  // run. AI nodes (command/prompt) only — rejected at load on every other node type
+  // (see loader.ts parseDagNode). See node-fallback-repair-design.md.
+  fallback: z.string().min(1).optional(),
   // Per-node override for which filesystem setting sources Claude loads
   // (CLAUDE.md, skills, commands, agents). Omitting it inherits the
   // assistant-level default (['project', 'user'] when unset). Claude-only;
@@ -885,6 +894,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.maxBudgetUsd !== undefined ? { maxBudgetUsd: data.maxBudgetUsd } : {}),
       ...(data.systemPrompt !== undefined ? { systemPrompt: data.systemPrompt } : {}),
       ...(data.fallbackModel !== undefined ? { fallbackModel: data.fallbackModel } : {}),
+      ...(data.fallback !== undefined ? { fallback: data.fallback } : {}),
       ...(data.settingSources !== undefined ? { settingSources: data.settingSources } : {}),
       ...(data.betas !== undefined ? { betas: data.betas } : {}),
       ...(data.sandbox !== undefined ? { sandbox: data.sandbox } : {}),

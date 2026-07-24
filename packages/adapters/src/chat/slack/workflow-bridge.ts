@@ -162,9 +162,11 @@ export class SlackWorkflowBridge {
         case 'workflow_cancelled':
           await this.onTerminal(event.runId, 'cancelled', conversationId, event.reason);
           break;
-        // Loop / tool / artifact / container-lifecycle events would surface as
-        // noise in-thread and aren't tied to a button or actionable state; the
-        // status message already conveys run health via the DAG node states.
+        // Loop / tool / artifact / container-lifecycle / fallback-triggered events
+        // would surface as noise in-thread and aren't tied to a button or actionable
+        // state; the status message already conveys run health via the DAG node
+        // states. A fallback is a mid-flight retry (the node isn't failed yet), so it
+        // deliberately doesn't flip the node's Slack status either.
         case 'loop_iteration_started':
         case 'loop_iteration_completed':
         case 'loop_iteration_failed':
@@ -174,6 +176,7 @@ export class SlackWorkflowBridge {
         case 'task_activity':
         case 'hook_activity':
         case 'container_lifecycle':
+        case 'node_fallback_triggered':
           break;
         default: {
           const exhaustive: never = event;

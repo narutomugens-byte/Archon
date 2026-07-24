@@ -108,6 +108,25 @@ interface NodeFailedEvent {
   error: string;
 }
 
+/**
+ * A command/prompt node failed with a fallback-eligible error (quota or output_format
+ * schema-miss) and `fallback:` was configured, so the executor is re-dispatching it
+ * once on a different provider before failing the run. See
+ * node-fallback-repair-design.md §5/§8. `fromModel`/`toModel` are the resolved model
+ * strings (absent when the node/provider had none resolved).
+ */
+interface NodeFallbackTriggeredEvent {
+  type: 'node_fallback_triggered';
+  runId: string;
+  nodeId: string;
+  nodeName: string;
+  fromProvider: string;
+  fromModel?: string;
+  toProvider: string;
+  toModel?: string;
+  reason: 'quota' | 'schema_miss';
+}
+
 interface NodeSkippedEvent {
   type: 'node_skipped';
   runId: string;
@@ -216,6 +235,7 @@ export type WorkflowEmitterEvent =
   | NodeStartedEvent
   | NodeCompletedEvent
   | NodeFailedEvent
+  | NodeFallbackTriggeredEvent
   | NodeSkippedEvent
   | WorkflowArtifactEvent
   | ToolStartedEvent

@@ -602,6 +602,11 @@ function renderWorkflowEvent(event: WorkflowEmitterEvent, verbose: boolean): voi
     case 'node_failed':
       process.stderr.write(`[${event.nodeName}] Failed: ${event.error}\n`);
       break;
+    case 'node_fallback_triggered':
+      process.stderr.write(
+        `[${event.nodeName}] Falling back (${event.reason}): ${event.fromProvider} → ${event.toProvider}\n`
+      );
+      break;
     case 'node_skipped':
       process.stderr.write(`[${event.nodeName}] Skipped (${event.reason})\n`);
       break;

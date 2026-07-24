@@ -127,6 +127,12 @@ export const workflowBaseSchema = z.object({
   effort: effortLevelSchema.optional(),
   thinking: thinkingConfigSchema.optional(),
   fallbackModel: z.string().min(1).optional(),
+  /**
+   * Workflow-level default for the engine-level cross-provider `fallback:` (see
+   * `dag-node.ts`). Applies to every command/prompt AI node in the workflow;
+   * a node-level `fallback:` overrides this default.
+   */
+  fallback: z.string().min(1).optional(),
   betas: betasSchema.optional(),
   sandbox: sandboxSettingsSchema.optional(),
   worktree: workflowWorktreePolicySchema.optional(),
