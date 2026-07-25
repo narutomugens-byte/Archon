@@ -325,6 +325,41 @@ const FIXTURES: Fixture[] = [
     expectGate: 'PASS',
     expectExitZero: true,
   },
+  {
+    name: 'multifile-one-untested-added',
+    why: 'DIFF-WIDE gaming vector (v1.5): commit ADDS two non-test files — a.ts is genuinely tested (real assertion), b.ts only has a vacuous test that references it as a value. The old diff-wide probe PASSed (a.ts made the whole revert red); the per-file probe must FAIL and name b.ts as unprotected.',
+    base: { 'README.md': '# fixture\n' },
+    change: {
+      'a.ts': 'export const a = (): number => 1;\n',
+      'b.ts': 'export const b = (): number => 2;\n',
+      'ab.test.ts':
+        "import { test, expect } from 'bun:test';\n" +
+        "import { a } from './a';\n" +
+        "import { b } from './b';\n" +
+        "test('a real', () => { expect(a()).toBe(1); });\n" +
+        "test('b vacuous', () => { const _ = b; expect(1 + 1).toBe(2); });\n",
+    },
+    expectGate: 'FAIL',
+    expectExitZero: false,
+    expectReason: 'b.ts',
+  },
+  {
+    name: 'multifile-both-tested-added',
+    why: 'anti-over-correction twin: the same two added files, but BOTH have a real assertion that calls the export. Each file\u2019s solo revert throws under the stub -> RED -> both individually protected -> PASS. The strict per-file policy must not fail a genuinely-covered multi-file change.',
+    base: { 'README.md': '# fixture\n' },
+    change: {
+      'a.ts': 'export const a = (): number => 1;\n',
+      'b.ts': 'export const b = (): number => 2;\n',
+      'ab.test.ts':
+        "import { test, expect } from 'bun:test';\n" +
+        "import { a } from './a';\n" +
+        "import { b } from './b';\n" +
+        "test('a real', () => { expect(a()).toBe(1); });\n" +
+        "test('b real', () => { expect(b()).toBe(2); });\n",
+    },
+    expectGate: 'PASS',
+    expectExitZero: true,
+  },
 ];
 
 // ── plumbing ──────────────────────────────────────────────────────────────────

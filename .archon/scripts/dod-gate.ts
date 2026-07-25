@@ -7,8 +7,10 @@
  *
  * What it does (all deterministic — NO LLM in the pass/fail decision):
  *   R1  Re-executes the operator's acceptance CHECKS itself. Any non-zero -> FAIL.
- *   R2  Test-efficacy REVERT-PROBE: reverts only the non-test source changes and
- *       re-runs the test command; if no test flips red, the tests are vacuous -> FAIL.
+ *   R2  Test-efficacy REVERT-PROBE (per-file): reverts EACH changed non-test source
+ *       file individually and re-runs the test command; a file whose solo revert flips
+ *       no test red is unprotected -> FAIL, naming it. Efficacy PASSes iff every changed
+ *       non-test file is individually protected.
  *   R3  Self-scoped: reads ONLY this run's own worktree (process.cwd()). It issues
  *       no shared-store query at all, so it can never misread another run's result.
  *   R4  Hard-stop: exits non-zero on any FAIL so a downstream push/PR node cannot run.
@@ -48,11 +50,15 @@
  *     on the result" from "invokes and ignores it" needs assertion-dataflow analysis,
  *     which is out of scope. The gate catches "never invokes it at all", not "invokes it
  *     but checks nothing".
- *   - DIFF-WIDE, NOT PER-FILE: the probe reverts ALL non-test files at once and requires
- *     the suite to go red as a whole. One genuinely-tested changed file therefore
- *     satisfies efficacy for the ENTIRE commit — a second changed file with no real
- *     coverage is not separately flagged. Keep one logical change per commit; a per-file
- *     revert-probe (O(number-of-files) suite runs) is a future increment.
+ *   - PER-FILE (v1.5): the probe reverts EACH changed non-test file individually and
+ *     requires that file's solo revert to turn at least one test red. A file that stays
+ *     green when reverted alone is unprotected and FAILs, named in verdict.json.efficacy.
+ *     This closes the earlier diff-wide blind spot (an untested file bundled with a
+ *     tested one). Cost is O(number-of-changed-non-test-files) suite runs; a single-file
+ *     change (the common case) is N=1 — identical cost and behavior to the diff-wide probe.
+ *     STRICT policy: every changed non-test file must be individually protected, so a
+ *     legitimate refactor whose helper file no test hits directly will FAIL — split the
+ *     commit or add a direct test (the right response for an unattended gate).
  *
  * Acceptance spec resolution (first found wins):
  *   1. $DOD_SPEC              — explicit path to a .json spec
@@ -125,6 +131,8 @@ interface Efficacy {
   nonTest_files?: number;
   baseline_green?: boolean;
   red_under_revert?: boolean;
+  protected_files?: string[];   // changed non-test files whose solo revert turned a test red
+  unprotected_files?: string[]; // changed non-test files that stayed green when reverted alone
   reason?: string;
 }
 
@@ -304,13 +312,19 @@ function writeVerdict(
             )
             .join('\n') || '- (none)'
         }\n\n` +
-        `## Test efficacy (revert-probe)\n- verdict: ${body.efficacy.verdict}` +
+        `## Test efficacy (per-file revert-probe)\n- verdict: ${body.efficacy.verdict}` +
         (body.efficacy.reason ? ` — ${body.efficacy.reason}` : '') +
-        `\n\n> "efficacy PASS" means at least one test flipped red when the implementation was\n` +
-        `> removed. It does NOT mean the tests catch every wrong value, that a test which\n` +
-        `> only invokes the change (without asserting on its result) is meaningful, or that\n` +
-        `> every changed file is covered — efficacy is proven across the whole diff, not\n` +
-        `> per file. Keep one logical change per commit.\n` +
+        (body.efficacy.protected_files?.length
+          ? `\n- protected (solo revert turns a test red): ${body.efficacy.protected_files.join(', ')}`
+          : '') +
+        (body.efficacy.unprotected_files?.length
+          ? `\n- unprotected (solo revert leaves every test green): ${body.efficacy.unprotected_files.join(', ')}`
+          : '') +
+        `\n\n> "efficacy PASS" means EVERY changed non-test file is individually protected:\n` +
+        `> reverting that one file alone flips at least one test red. It does NOT mean the\n` +
+        `> tests catch every wrong value, nor that a test which only invokes the change\n` +
+        `> (without asserting on its result) is meaningful. A file that stays green when\n` +
+        `> reverted alone is unprotected and FAILs, named above.\n` +
         `\n## Reproduce\n\`${reproduce}\`\n`;
       writeFileSync(join(dir, 'verdict.md'), md);
     } catch {
@@ -580,36 +594,59 @@ async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise
     addedStubs.set(f, stubLines.join('\n'));
   }
 
-  let redUnderRevert = false;
-  try {
-    for (const f of nonTest) {
+  // Per-file revert-probe (v1.5): revert each changed non-test file ALONE, run the tests,
+  // and require that solo revert to turn at least one test red. A file that stays green
+  // when reverted by itself is unprotected. STRICT: efficacy PASSes iff every file is
+  // individually protected. N=1 (the common single-file change) behaves exactly as the
+  // former diff-wide probe. Serial by construction (each iteration mutates then restores
+  // the one file); O(number-of-changed-non-test-files) suite runs — no parallelism.
+  const protectedFiles: string[] = [];
+  const unprotectedFiles: string[] = [];
+
+  for (const f of nonTest) {
+    let red = false;
+    try {
+      // Revert ONLY this file (others stay at HEAD).
       if (existedAtBase.get(f)) {
-        git(['checkout', base, '--', f]);
+        git(['checkout', base, '--', f]); // modified or deleted-at-HEAD -> restore base content
       } else {
-        // Added file: replace with a throwing stub that preserves exports so a
-        // test that only imports but never calls the symbol stays green (vacuous).
+        // Added file: throwing stub that preserves the export surface but removes behavior,
+        // so a test that only imports (never calls) the symbol stays green (vacuous).
         try {
           writeFileSync(join(cwd, f), addedStubs.get(f)!);
         } catch {
-          /* unwritable path is caught by the post-restore cleanliness check */
+          /* unwritable path is surfaced by the per-file cleanliness check below */
         }
       }
-    }
-    const revertRun = await runShell(testCmd.run);
-    redUnderRevert = revertRun.code !== 0;
-  } finally {
-    for (const f of nonTest) {
+      const revertRun = await runShell(testCmd.run);
+      red = revertRun.code !== 0;
+    } finally {
+      // Restore ONLY this file to its HEAD state, leaving the tree clean for the next file.
       if (existsAtHead.get(f)) {
         git(['checkout', 'HEAD', '--', f]); // present at HEAD -> restore committed content
       } else {
-        // Deleted at HEAD but resurrected by the probe (it existed at base): return the
-        // tree to HEAD's "file absent" state instead of a checkout that fails on a path
-        // absent from HEAD and leaves it staged as `A`.
+        // Deleted at HEAD but resurrected by the probe: return to HEAD's "file absent" state.
         git(['rm', '-f', '--quiet', '--', f]);
       }
     }
+
+    // Cleanliness guard: the tree must be clean again before probing the next file.
+    if (trackedDirty([f]).length > 0) {
+      return {
+        ran: true,
+        verdict: 'UNVERIFIED',
+        test_files_changed: testFiles.length,
+        nonTest_files: nonTest.length,
+        baseline_green: true,
+        reason: `revert-probe could not cleanly restore ${f} — run \`git checkout HEAD -- .\` and re-gate`,
+      };
+    }
+
+    if (red) protectedFiles.push(f);
+    else unprotectedFiles.push(f);
   }
 
+  // Whole-set cleanliness safety net (preserves the existing final guard).
   const stillDirty = trackedDirty(nonTest);
   if (stillDirty.length > 0) {
     return {
@@ -618,12 +655,11 @@ async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise
       test_files_changed: testFiles.length,
       nonTest_files: nonTest.length,
       baseline_green: true,
-      red_under_revert: redUnderRevert,
       reason: 'revert-probe could not cleanly restore the tree — run `git checkout HEAD -- .` and re-gate',
     };
   }
 
-  if (!redUnderRevert) {
+  if (unprotectedFiles.length > 0) {
     return {
       ran: true,
       verdict: 'FAIL',
@@ -631,8 +667,13 @@ async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise
       nonTest_files: nonTest.length,
       baseline_green: true,
       red_under_revert: false,
+      protected_files: protectedFiles,
+      unprotected_files: unprotectedFiles,
       reason:
-        'tests still pass with the implementation reverted — they are vacuous (they do not exercise the change)',
+        `${unprotectedFiles.length} of ${nonTest.length} changed non-test file(s) are unprotected — ` +
+        `reverting each one alone leaves every test green, so their tests are vacuous ` +
+        `(nothing exercises them): ${unprotectedFiles.join(', ')}. ` +
+        `Add a test that fails when the file is reverted, or split the commit.`,
     };
   }
 
@@ -643,7 +684,11 @@ async function runRevertProbe(spec: Spec, testCmd: Check, base: string): Promise
     nonTest_files: nonTest.length,
     baseline_green: true,
     red_under_revert: true,
-    reason: 'at least one test flips red when the implementation is reverted',
+    protected_files: protectedFiles,
+    unprotected_files: [],
+    reason:
+      `all ${nonTest.length} changed non-test file(s) are individually protected — ` +
+      `reverting any one alone turns at least one test red`,
   };
 }
 
