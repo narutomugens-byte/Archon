@@ -2592,6 +2592,35 @@ nodes:
       expect(result.errors[0].error).toContain("'fallback' is only valid on command/prompt");
       expect(result.errors[0].error).toContain('cancel');
     });
+
+    it('rejects fallback: on a bash node nested inside a loop_group body (Finding #3)', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'fallback-reject-loop-group-body.yaml'),
+        `
+name: fallback-reject-loop-group-body
+description: fallback rejected on a bash node nested in a loop_group body
+nodes:
+  - id: outer-loop
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: inner-bash
+          bash: "echo hi"
+          fallback: large
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].errorType).toBe('validation_error');
+      expect(result.errors[0].error).toContain("'fallback' is only valid on command/prompt");
+      expect(result.errors[0].error).toContain('bash');
+      expect(result.errors[0].error).toContain('inner-bash');
+    });
   });
 
   describe('loop node parsing', () => {

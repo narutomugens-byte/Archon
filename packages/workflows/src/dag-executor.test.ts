@@ -8767,6 +8767,62 @@ describe('executeDagWorkflow -- node fallback (node-fallback-repair-design.md)',
     expect(store.failWorkflowRun).not.toHaveBeenCalled();
   });
 
+  it('persist_session: true node whose primary fails on quota and fallback succeeds persists the session under the FALLBACK provider, not the primary (#1992, Finding #1)', async () => {
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield { type: 'assistant', content: "You're out of extra usage · resets in 2h" };
+      yield { type: 'result', sessionId: 'sess-primary-quota' };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'Fallback provider succeeded' };
+      yield { type: 'result', sessionId: 'sess-fallback-ok' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('fallback-quota-session-run');
+    const aiProfile = buildAiProfile('claude', {
+      repoTiers: { medium: { provider: 'codex', model: 'gpt-5.5' } },
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-fallback-quota-session',
+      testDir,
+      {
+        name: 'fallback-quota-session-test',
+        nodes: [
+          { id: 'implement', prompt: 'Do the work', fallback: 'medium', persist_session: true },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      aiProfile
+    );
+
+    const upsertMock = store.upsertWorkflowNodeSession as Mock<
+      typeof store.upsertWorkflowNodeSession
+    >;
+    expect(upsertMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'codex',
+        provider_session_id: 'sess-fallback-ok',
+      })
+    );
+    expect(store.completeWorkflowRun).toHaveBeenCalled();
+  });
+
   it('output_format schema-miss on a best-effort provider re-dispatches to an enforced fallback and completes', async () => {
     // Calls 1-4 (pi, primary): 1 initial + 3 reasks, every attempt returns structured
     // output missing the required `verdict` field → reask budget exhausted →
@@ -8848,8 +8904,102 @@ describe('executeDagWorkflow -- node fallback (node-fallback-repair-design.md)',
     expect(fb.toProvider).toBe('claude');
     expect(fb.reason).toBe('schema_miss');
 
+    // Finding #4: the fallback wrapper deliberately keeps node.provider ('pi')
+    // while resolving fallback: 'large' to a different provider ('claude') —
+    // that combination must not trip the spurious model/provider-conflict
+    // warning (only the node_fallback_triggered notice above is expected).
+    const sendMessageCalls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls;
+    const conflictWarnings = sendMessageCalls.filter(
+      call => typeof call[1] === 'string' && (call[1] as string).includes('sets provider')
+    );
+    expect(conflictWarnings).toHaveLength(0);
+
     expect(store.completeWorkflowRun).toHaveBeenCalled();
     expect(store.failWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('sums the primary attempt cost with the fallback attempt cost, not just the fallback (Finding #2)', async () => {
+    // Calls 1-4 (pi, primary): 4 reask attempts, each costs 0.01 → the failed
+    // primary NodeExecutionResult carries costUsd: 0.04 (accumulated across
+    // reasks, same as the schema-miss test above). Call 5 (claude, fallback):
+    // costs 0.05 and succeeds. Both must land in the run's total_cost_usd — not
+    // just the fallback's 0.05, which is what a blank fallback initialOutput
+    // would silently produce.
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      calls++;
+      if (calls <= 4) {
+        yield {
+          type: 'result',
+          sessionId: `s${String(calls)}`,
+          structuredOutput: { other: 'x' },
+          cost: 0.01,
+        };
+      } else {
+        yield {
+          type: 'result',
+          sessionId: 'fallback-schema-ok',
+          structuredOutput: { verdict: 'approved' },
+          cost: 0.05,
+        };
+      }
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('fallback-schema-miss-cost-run');
+    const aiProfile = buildAiProfile('claude', {
+      repoTiers: { large: { provider: 'claude', model: 'opus' } },
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-fallback-schema-cost',
+      testDir,
+      {
+        name: 'fallback-schema-miss-cost-test',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'decide',
+            provider: 'pi',
+            output_format: {
+              type: 'object',
+              properties: { verdict: { type: 'string' } },
+              required: ['verdict'],
+            },
+            retry: { max_attempts: 0 },
+            fallback: 'large',
+          },
+        ],
+      },
+      workflowRun,
+      'pi',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'pi' },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      aiProfile
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(5);
+
+    const completeCalls = (
+      store.completeWorkflowRun as Mock<
+        (id: string, metadata?: Record<string, unknown>) => Promise<void>
+      >
+    ).mock.calls;
+    expect(completeCalls.length).toBe(1);
+    const metadata = completeCalls[0][1] as Record<string, unknown>;
+    expect(metadata.total_cost_usd as number).toBeCloseTo(0.09, 5);
   });
 
   it('fails the run when the fallback attempt also fails (fail-fast, single fallback attempt)', async () => {

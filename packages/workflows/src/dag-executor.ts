@@ -685,7 +685,7 @@ async function runNodeWithFallback(
   stepNamePrefix: string,
   iteration: number | undefined,
   primaryRun: () => Promise<NodeExecutionResult>
-): Promise<NodeExecutionResult> {
+): Promise<{ output: NodeExecutionResult; actualProvider: string }> {
   const initialOutput: NodeExecutionResult = {
     state: 'failed',
     output: '',
@@ -704,13 +704,13 @@ async function runNodeWithFallback(
 
   const fallbackRef = node.fallback ?? workflowLevelOptions.fallback;
   if (output.state !== 'failed' || !fallbackRef || !isFallbackEligible(output)) {
-    return output;
+    return { output, actualProvider: primaryProvider };
   }
   // Redundant with isFallbackEligible above, but written as a direct field
   // comparison (rather than relying on the opaque boolean-returning helper) so
   // TypeScript narrows `output.failureReason` to a concrete union member below.
   if (output.failureReason === undefined) {
-    return output;
+    return { output, actualProvider: primaryProvider };
   }
   const reason = output.failureReason;
 
@@ -733,7 +733,12 @@ async function runNodeWithFallback(
     workflowLevelOptions,
     aiProfile,
     workflowPreset,
-    execContext
+    execContext,
+    // Suppress dag.model_provider_conflict — a cross-provider fallback
+    // intentionally keeps node.provider while resolving a different provider
+    // from fallbackRef; that's the feature working, not a misconfiguration
+    // (Finding #4).
+    true
   );
 
   if (fb.provider === primaryProvider) {
@@ -751,7 +756,7 @@ async function runNodeWithFallback(
       `Warning: Node '${node.id}' failed on **${primaryProvider}** but its \`fallback: ${fallbackRef}\` also resolves to **${primaryProvider}** — skipping the pointless same-provider retry.`,
       { workflowId: workflowRun.id, nodeName: node.id }
     );
-    return output;
+    return { output, actualProvider: primaryProvider };
   }
 
   getWorkflowEventEmitter().emit({
@@ -783,7 +788,7 @@ async function runNodeWithFallback(
     { workflowId: workflowRun.id, nodeName: node.id }
   );
 
-  return runNodeRetryLoop(
+  const fallbackOutput = await runNodeRetryLoop(
     node,
     platform,
     conversationId,
@@ -817,6 +822,33 @@ async function runNodeWithFallback(
       ),
     initialOutput
   );
+  // executeNodeInternal computes costUsd/tokens even for a failed primary
+  // attempt (schema_miss can burn up to 4x calls before failing) — sum the
+  // primary attempt's cost/tokens into the final result so total spend
+  // reflects BOTH attempts, regardless of whether the fallback itself
+  // succeeds (node-fallback-repair-design.md §7, Finding #2).
+  const combinedCostUsd =
+    output.costUsd !== undefined || fallbackOutput.costUsd !== undefined
+      ? (output.costUsd ?? 0) + (fallbackOutput.costUsd ?? 0)
+      : undefined;
+  const combinedTokens =
+    output.tokens !== undefined || fallbackOutput.tokens !== undefined
+      ? {
+          input: (output.tokens?.input ?? 0) + (fallbackOutput.tokens?.input ?? 0),
+          output: (output.tokens?.output ?? 0) + (fallbackOutput.tokens?.output ?? 0),
+        }
+      : undefined;
+  // The session actually came from the fallback provider — tag it as such so
+  // the caller persists/resumes under the RIGHT provider, not the primary
+  // `primaryProvider` const (#1992, node-fallback-repair-design.md §7, Finding #1).
+  return {
+    output: {
+      ...fallbackOutput,
+      ...(combinedCostUsd !== undefined ? { costUsd: combinedCostUsd } : {}),
+      ...(combinedTokens !== undefined ? { tokens: combinedTokens } : {}),
+    },
+    actualProvider: fb.provider,
+  };
 }
 
 /**
@@ -1103,7 +1135,14 @@ async function resolveNodeProviderAndModel(
   workflowLevelOptions: WorkflowLevelOptions,
   aiProfile?: ResolvedAiProfile,
   workflowPreset?: ModelAliasPreset,
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  // Set only by runNodeWithFallback's re-resolution of a synthesized fallback
+  // node (node.provider intentionally kept, model swapped to the fallback ref
+  // — see its comment). That combination is expected to diverge by design when
+  // the fallback resolves to a different provider, so the conflict warning
+  // would be spurious noise on the feature's primary use case
+  // (node-fallback-repair-design.md §7, Finding #4).
+  suppressProviderConflictWarning = false
 ): Promise<{
   provider: string;
   model: string | undefined;
@@ -1124,7 +1163,7 @@ async function resolveNodeProviderAndModel(
         preset = modelSpec;
         provider = modelSpec.provider;
         model = modelSpec.model;
-        if (node.provider && node.provider !== provider) {
+        if (node.provider && node.provider !== provider && !suppressProviderConflictWarning) {
           getLog().warn(
             {
               nodeId: node.id,
@@ -6141,7 +6180,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // runNodeWithFallback wraps this same-provider path UNCHANGED and, only on
           // a fallback-eligible failure with `fallback:` configured, re-dispatches
           // once on a different provider (node-fallback-repair-design.md §5).
-          const output = await runNodeWithFallback(
+          const { output, actualProvider } = await runNodeWithFallback(
             node,
             deps,
             platform,
@@ -6246,7 +6285,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   workflow_name: workflowName,
                   node_id: node.id,
                   scope_key: persistScopeKey,
-                  provider,
+                  provider: actualProvider,
                   provider_session_id: output.sessionId,
                   last_run_id: workflowRun.id,
                 });
@@ -6259,7 +6298,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   workflow_name: workflowName,
                   scope_key: persistScopeKey,
                   node_id: node.id,
-                  provider,
+                  provider: actualProvider,
                 });
               }
             } catch (err) {
@@ -6272,20 +6311,20 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   nodeId: node.id,
                   workflow: workflowName,
                   scopeKey: persistScopeKey,
-                  provider,
+                  provider: actualProvider,
                 },
                 'persist_session_upsert_failed'
               );
               await safeSendMessage(
                 platform,
                 conversationId,
-                `⚠️ Could not persist the session for node \`${node.id}\` (${provider}). The next run will start this node fresh.`,
+                `⚠️ Could not persist the session for node \`${node.id}\` (${actualProvider}). The next run will start this node fresh.`,
                 { workflowId: workflowRun.id, nodeName: node.id }
               );
             }
           }
 
-          return { nodeId: node.id, output, sessionProvider: provider };
+          return { nodeId: node.id, output, sessionProvider: actualProvider };
         } catch (error) {
           const err = error as Error;
           getLog().error({ err, nodeId: node.id }, 'dag_node_pre_execution_failed');

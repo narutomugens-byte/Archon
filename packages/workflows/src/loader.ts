@@ -164,6 +164,49 @@ function parseDagNode(raw: unknown, index: number, errors: string[]): DagNode | 
 }
 
 /**
+ * Recursively reject 'fallback:' on non-AI nodes nested inside loop_group
+ * bodies. The check in parseDagNode above only ever sees the top-level
+ * raw.nodes array — a loop_group body is a nested raw sub-DAG that never
+ * passes back through parseDagNode, so 'fallback' on a bash/script/approval/
+ * cancel/loop/loop_group/include/workflow body node silently rides along
+ * unrejected (node-fallback-repair-design.md §7, Finding #3). Recurses
+ * through nested loop_groups.
+ */
+function rejectFallbackInLoopGroupBody(rawNode: unknown, node: DagNode, errors: string[]): void {
+  if (!isLoopGroupNode(node)) return;
+  const rawLoopGroup = (rawNode as Record<string, unknown> | null)?.loop_group;
+  const rawBodyNodes = Array.isArray((rawLoopGroup as Record<string, unknown> | undefined)?.nodes)
+    ? (rawLoopGroup as { nodes: unknown[] }).nodes
+    : [];
+
+  node.loop_group.nodes.forEach((bodyNode, i) => {
+    const rawBodyNode = rawBodyNodes[i];
+    let nonAiType: string | undefined;
+    if (isCancelNode(bodyNode)) nonAiType = 'cancel';
+    else if (isIncludeNode(bodyNode)) nonAiType = 'include';
+    else if (isWorkflowNode(bodyNode)) nonAiType = 'workflow';
+    else if (isApprovalNode(bodyNode)) nonAiType = 'approval';
+    else if (isLoopNode(bodyNode)) nonAiType = 'loop';
+    else if (isLoopGroupNode(bodyNode)) nonAiType = 'loop_group';
+    else if (isScriptNode(bodyNode)) nonAiType = 'script';
+    else if ('bash' in bodyNode && typeof bodyNode.bash === 'string') nonAiType = 'bash';
+
+    if (
+      nonAiType &&
+      rawBodyNode !== null &&
+      typeof rawBodyNode === 'object' &&
+      (rawBodyNode as Record<string, unknown>).fallback !== undefined
+    ) {
+      errors.push(
+        `Node '${bodyNode.id}': 'fallback' is only valid on command/prompt (AI) nodes, not on ${nonAiType} nodes. Remove 'fallback' or use a command/prompt node.`
+      );
+    }
+
+    rejectFallbackInLoopGroupBody(rawBodyNode, bodyNode, errors);
+  });
+}
+
+/**
  * Validate DAG structure: unique IDs, depends_on references exist, no cycles,
  * and $nodeId.output refs in when:/prompt: fields point to known nodes.
  * Returns error message or null if valid.
@@ -406,11 +449,20 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
 
     // Parse DAG nodes using dagNodeSchema
     const validationErrors: string[] = [];
-    const dagNodes = (raw.nodes as unknown[])
+    const rawTopLevelNodes = raw.nodes as unknown[];
+    const dagNodes = rawTopLevelNodes
       .map((n: unknown, i: number) => parseDagNode(n, i, validationErrors))
       .filter((n): n is DagNode => n !== null);
 
-    if (dagNodes.length !== (raw.nodes as unknown[]).length) {
+    if (dagNodes.length === rawTopLevelNodes.length) {
+      // Recurse the fallback reject into loop_group bodies now that every
+      // top-level node parsed cleanly (Finding #3, node-fallback-repair-design.md §7).
+      dagNodes.forEach((node, i) => {
+        rejectFallbackInLoopGroupBody(rawTopLevelNodes[i], node, validationErrors);
+      });
+    }
+
+    if (dagNodes.length !== rawTopLevelNodes.length || validationErrors.length > 0) {
       getLog().warn({ filename, validationErrors }, 'dag_node_validation_failed');
       return {
         workflow: null,
