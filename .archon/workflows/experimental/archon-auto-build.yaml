@@ -63,6 +63,44 @@ nodes:
       fi
     depends_on: [create-plan]
 
+  # Pre-warm dependencies. Archon worktrees are BARE (only .archon is copied — no
+  # node_modules), and the implement command's own install phase is prompt-level,
+  # so an agent that skips it leaves `validate` failing for a missing-deps reason
+  # that reads like a code failure. Installing here makes it deterministic.
+  - id: install-deps
+    depends_on: [bridge-artifacts]
+    timeout: 600000
+    bash: |
+      set -euo pipefail
+      unset GIT_DIR GIT_WORK_TREE
+      if [ ! -f package.json ]; then
+        echo "No package.json in the worktree — nothing to install"
+        exit 0
+      fi
+      if [ -d node_modules ]; then
+        echo "node_modules already present — skipping install"
+        exit 0
+      fi
+      if [ -f bun.lock ] || [ -f bun.lockb ]; then
+        INSTALL="bun install"
+      elif [ -f pnpm-lock.yaml ]; then
+        INSTALL="pnpm install"
+      elif [ -f yarn.lock ]; then
+        INSTALL="yarn install"
+      else
+        INSTALL="npm install"
+      fi
+      INSTALL_BIN=${INSTALL%% *}
+      if ! command -v "$INSTALL_BIN" >/dev/null 2>&1; then
+        echo "'$INSTALL_BIN' is not on PATH — the worktree cannot be prepared, and every" >&2
+        echo "downstream validate/test step would fail for the wrong reason. Launch the run" >&2
+        echo "from a shell where '$INSTALL_BIN' resolves." >&2
+        exit 1
+      fi
+      echo "Installing dependencies with: $INSTALL"
+      $INSTALL
+      echo "Dependencies installed"
+
   # ═══════════════════════════════════════════════════════════════
   # PHASE 2: IMPLEMENT  (Kimi codes)
   # Routed to the pi provider / Kimi For Coding. Opus already decided what to
@@ -71,7 +109,7 @@ nodes:
 
   - id: implement
     command: archon-fix-issue
-    depends_on: [bridge-artifacts]
+    depends_on: [install-deps]
     context: fresh
     provider: pi
     model: kimi-coding/kimi-for-coding
