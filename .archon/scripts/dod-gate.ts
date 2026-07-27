@@ -162,7 +162,32 @@ interface Efficacy {
   reason?: string;
 }
 
-const DEFAULT_TEST_GLOBS = ['**/*.test.ts', '**/*.spec.ts', '**/*.test.tsx', '**/*_test.py', '**/test_*.py'];
+// v1.11: EXACT suffix patterns only — never a directory glob (`test/**`) or a
+// substring match (`**/*test*`). This list is an EXEMPTION set: anything matching
+// it is excluded from the revert probe and counts as "protection", so an over-broad
+// entry is a silent false PASS (change `test/helper.js`, claim the change is tested).
+// Erring narrow only costs a false FAIL. Pre-v1.11 the list carried the TS/Python
+// suffixes but no JS ones at all, so in any JavaScript repo a real `*.test.js` edit
+// was classified as behavioral source — "no test file changed — nothing protects
+// this change" on genuinely well-tested work. The 43-fixture harness could not see
+// it because every fixture pins `test_globs` in its own spec; only the calibration
+// suite, which leaves the default in force, exercises this constant.
+const DEFAULT_TEST_GLOBS = [
+  '**/*.test.ts',
+  '**/*.test.tsx',
+  '**/*.test.js',
+  '**/*.test.jsx',
+  '**/*.test.mjs',
+  '**/*.test.cjs',
+  '**/*.spec.ts',
+  '**/*.spec.tsx',
+  '**/*.spec.js',
+  '**/*.spec.jsx',
+  '**/*.spec.mjs',
+  '**/*.spec.cjs',
+  '**/*_test.py',
+  '**/test_*.py',
+];
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 function tail(s: string, n = 2000): string {

@@ -173,6 +173,26 @@ const UNICODE_LONG_REAL_TEST =
   `import { ${UNICODE_LONG_NAME} } from './u';\n` +
   `test('real', () => { expect(${UNICODE_LONG_NAME}).toBe(42); });\n`;
 
+// ── v1.11: default-test-glob bodies (JavaScript, not TypeScript) ──────────────
+// These two fixtures are the ONLY ones that leave `test_globs` unset, so they are
+// the only coverage DEFAULT_TEST_GLOBS has. Everything else in this table pins
+// `test_globs` in its own spec, which is exactly how the pre-v1.11 JS gap survived
+// 43/43 green.
+const V111_JS_IMPL_GOOD = 'export const add = (a, b) => a + b;\n';
+const V111_JS_REAL_TEST =
+  "import { test, expect } from 'bun:test';\n" +
+  "import { add } from './math.js';\n" +
+  "test('add works', () => { expect(add(2, 3)).toBe(5); });\n";
+// A behavioral source file whose NAME contains "test" but which is not a test file.
+// Guards the fix against being "generalized" into a substring/directory matcher.
+const V111_JS_TESTUTILS = 'export const buildFixture = (n) => ({ id: n, label: `row-${n}` });\n';
+const V111_JS_TESTUTILS_CHANGED = 'export const buildFixture = (n) => ({ id: n, label: `item-${n}` });\n';
+// Spec with NO test_globs key — forces the gate onto DEFAULT_TEST_GLOBS.
+const V111_DEFAULT_GLOB_SPEC = {
+  checks: [{ name: 'tests', run: 'bun test', is_test_command: true }],
+  require_test_efficacy: true,
+};
+
 const FIXTURES: Fixture[] = [
   {
     name: '1-good-change',
@@ -637,6 +657,30 @@ const FIXTURES: Fixture[] = [
     expectGate: 'PASS',
     expectExitZero: true,
     expectExcluded: ['.eslintrc.json'],
+  },
+  {
+    name: 'v111-default-globs-js-test-counts-as-test',
+    why: "v1.11 THE PERMANENT REGRESSION FIXTURE (found by the first dod-gate-calibrate run): with NO test_globs in the spec the gate falls back to DEFAULT_TEST_GLOBS, which pre-v1.11 listed only TS/TSX/Python suffixes. In a JavaScript repo that made `math.test.js` behavioral source, so a genuinely well-tested change reported 'no test file changed — nothing protects this change' and FAILed. Every other fixture here pins test_globs, so this constant had zero coverage. Now: the JS test is recognised, the revert probe runs, reverting math.js turns it red -> PASS.",
+    base: { 'README.md': '# fixture\n' },
+    change: { 'math.js': V111_JS_IMPL_GOOD, 'math.test.js': V111_JS_REAL_TEST },
+    spec: V111_DEFAULT_GLOB_SPEC,
+    expectGate: 'PASS',
+    expectExitZero: true,
+  },
+  {
+    name: 'v111-default-globs-testutils-is-not-a-test',
+    why: "v1.11 anti-over-correction twin: DEFAULT_TEST_GLOBS is an EXEMPTION set — anything matching it skips the revert probe and counts as protection. Widening the JS fix to a substring ('**/*test*') or a directory glob would make `src/testUtils.js` self-certifying. Here the commit changes ONLY that behavioral file while the real test stays untouched, so a correct exact-suffix list yields no test file changed -> FAIL, and the file must NOT be excluded. This fixture goes green only if the matcher stayed narrow.",
+    base: {
+      'math.js': V111_JS_IMPL_GOOD,
+      'math.test.js': V111_JS_REAL_TEST,
+      'src/testUtils.js': V111_JS_TESTUTILS,
+    },
+    change: { 'src/testUtils.js': V111_JS_TESTUTILS_CHANGED },
+    spec: V111_DEFAULT_GLOB_SPEC,
+    expectGate: 'FAIL',
+    expectExitZero: false,
+    expectReason: 'no test file changed',
+    expectNotExcluded: ['src/testUtils.js'],
   },
 ];
 
