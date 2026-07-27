@@ -127,6 +127,60 @@ mock.module('@archon/git', () => ({
   mkdirAsync: mock(async () => undefined),
 }));
 
+// Mock @archon/core so handleMessage can be observed in auto-review tests.
+// The mock also satisfies all other imports the adapter uses from this package.
+const mockHandleMessage = mock(async () => undefined);
+
+class MockConversationNotFoundError extends Error {
+  constructor(msg?: string) {
+    super(msg);
+    this.name = 'ConversationNotFoundError';
+  }
+}
+class MockAppNotInstalledError extends Error {
+  constructor(owner: string, repo: string, slug: string) {
+    super(`App not installed for ${owner}/${repo} (${slug})`);
+    this.name = 'AppNotInstalledError';
+  }
+}
+
+mock.module('@archon/core', () => ({
+  handleMessage: mockHandleMessage,
+  ConversationNotFoundError: MockConversationNotFoundError,
+  AppNotInstalledError: MockAppNotInstalledError,
+  classifyAndFormatError: mock((err: Error) => err?.message ?? 'An error occurred'),
+  toError: mock((e: unknown) => (e instanceof Error ? e : new Error(String(e)))),
+  getLinkedIssueNumbers: mock(async () => []),
+  onConversationClosed: mock(async () => undefined),
+  // ConversationLockManager used only as a type cast in tests — provide a stub.
+  ConversationLockManager: class {
+    acquireLock = mock(async (_: string, fn: () => Promise<void>) => fn());
+    getStats = (): unknown => ({
+      active: 0,
+      queuedTotal: 0,
+      queuedByConversation: [],
+      maxConcurrent: 10,
+      activeConversationIds: [],
+    });
+  },
+  // Simulate the real installCredentialHelper's git-config call so the
+  // "credential helper install is attempted after App-mode clone" test keeps
+  // its assertion that execFileAsync was called with 'config' in the args.
+  installCredentialHelper: mock(async (repoPath: string) => {
+    await mockExecFileAsync(
+      'git',
+      ['-C', repoPath, 'config', '--local', 'credential.helper', 'test'],
+      {}
+    );
+    return { kind: 'installed' as const, helperPath: '/test/git-credential-archon' };
+  }),
+  isPerUserGitHubEnabled: mock(() => false),
+}));
+
+mock.module('@archon/core/config/resolve-assistant', () => ({
+  resolveDefaultAssistant: mock(async () => 'claude'),
+}));
+
 import { GitHubAdapter } from './adapter';
 import { ConversationLockManager } from '@archon/core';
 // Namespace import so the dedup tests can spyOn(core, 'handleMessage') — the
@@ -1653,6 +1707,287 @@ describe('GitHubAdapter', () => {
         return Array.isArray(args) && args.includes('config');
       });
       expect(gitConfigCalls.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Ambient PR review (pull_request.opened auto-dispatch)
+  // ---------------------------------------------------------------------------
+  describe('ambient PR review', () => {
+    /**
+     * Build a realistic pull_request.opened webhook payload.
+     */
+    function createPullRequestOpenedPayload({
+      action = 'opened',
+      prNumber = 99,
+      headRef = 'feature/my-branch',
+      headSha = 'deadbeef1234567',
+      headRepoFullName = 'testuser/testrepo',
+      baseRepoFullName = 'testuser/testrepo',
+      senderLogin = 'developer',
+      title = 'My great feature',
+    }: {
+      action?: string;
+      prNumber?: number;
+      headRef?: string;
+      headSha?: string;
+      headRepoFullName?: string;
+      baseRepoFullName?: string;
+      senderLogin?: string;
+      title?: string;
+    } = {}): string {
+      return JSON.stringify({
+        action,
+        pull_request: {
+          number: prNumber,
+          title,
+          body: 'PR description',
+          user: { login: senderLogin },
+          state: 'open',
+          head: {
+            ref: headRef,
+            sha: headSha,
+            repo: { full_name: headRepoFullName },
+          },
+          base: {
+            ref: 'main',
+            repo: { full_name: baseRepoFullName },
+          },
+        },
+        repository: {
+          owner: { login: 'testuser' },
+          name: 'testrepo',
+          full_name: baseRepoFullName,
+          html_url: `https://github.com/${baseRepoFullName}`,
+          default_branch: 'main',
+        },
+        sender: { login: senderLogin },
+      });
+    }
+
+    let originalAllowedUsers: string | undefined;
+
+    beforeEach(() => {
+      originalAllowedUsers = process.env.GITHUB_ALLOWED_USERS;
+      delete process.env.GITHUB_ALLOWED_USERS;
+      mockHandleMessage.mockClear();
+      mockLockManager.acquireLock.mockClear();
+      mockGetOrCreateConversation.mockClear();
+      mockFindCodebaseByRepoUrl.mockClear();
+      mockCreateCodebase.mockClear();
+      mockFindOrCreateUserByPlatformIdentity.mockClear();
+      // Return an existing codebase so resolveDefaultAssistant is never called.
+      mockFindCodebaseByRepoUrl.mockResolvedValue({
+        id: 'codebase-test',
+        name: 'testuser/testrepo',
+        default_cwd: '/tmp/test-workspaces/testuser/testrepo/source',
+      });
+    });
+
+    afterEach(() => {
+      if (originalAllowedUsers !== undefined) {
+        process.env.GITHUB_ALLOWED_USERS = originalAllowedUsers;
+      } else {
+        delete process.env.GITHUB_ALLOWED_USERS;
+      }
+    });
+
+    function createAutoReviewAdapter(
+      opts: {
+        enableAutoReview?: boolean;
+        autoReviewWorkflow?: string;
+      } = {}
+    ): GitHubAdapter {
+      const adapter = new GitHubAdapter(
+        { kind: 'pat', token: 'fake-token-for-testing' },
+        'fake-webhook-secret',
+        mockLockManager,
+        undefined,
+        opts
+      );
+      // @ts-expect-error - bypassing signature verification
+      adapter.verifySignature = mock(() => true);
+      return adapter;
+    }
+
+    test('pull_request.opened + enableAutoReview:false → acquireLock NOT called', async () => {
+      const adapter = createAutoReviewAdapter({ enableAutoReview: false });
+      const payload = createPullRequestOpenedPayload();
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
+    });
+
+    test('pull_request.opened + enableAutoReview:true + non-fork + authorized → acquireLock called once with correct message and isolationHints', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      const payload = createPullRequestOpenedPayload({
+        prNumber: 99,
+        headRef: 'feature/my-branch',
+        headSha: 'deadbeef1234567',
+        title: 'My great feature',
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).toHaveBeenCalledTimes(1);
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+      // FIX 2: message must NOT include the PR title (attacker-controlled)
+      const calledMessage = mockHandleMessage.mock.calls[0][2] as string;
+      expect(calledMessage).toBe('/workflow run agentic-eval-gate-pr');
+      // FIX 1: isolationHints must identify this as a PR run so isolation checks
+      // out the correct branch rather than running on the base branch
+      const calledOptions = mockHandleMessage.mock.calls[0][3] as {
+        isolationHints: Record<string, unknown>;
+      };
+      expect(calledOptions.isolationHints.workflowType).toBe('pr');
+      expect(calledOptions.isolationHints.workflowId).toBe('99');
+      expect(calledOptions.isolationHints.prBranch).toBe('feature/my-branch');
+      expect(calledOptions.isolationHints.prSha).toBe('deadbeef1234567');
+      expect(calledOptions.isolationHints.isForkPR).toBe(false);
+    });
+
+    test('pull_request.opened + enableAutoReview:true + fork PR → acquireLock NOT called', async () => {
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      const payload = createPullRequestOpenedPayload({
+        headRepoFullName: 'contributor/testrepo', // fork — different from base
+        baseRepoFullName: 'testuser/testrepo',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
+    });
+
+    test('pull_request.opened + enableAutoReview:true + custom workflow → dispatched message is exactly /workflow run my-reviewer (no title)', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      const adapter = createAutoReviewAdapter({
+        enableAutoReview: true,
+        autoReviewWorkflow: 'my-reviewer',
+      });
+      const payload = createPullRequestOpenedPayload({
+        title: 'Add auth',
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).toHaveBeenCalledTimes(1);
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+      const calledMessage = mockHandleMessage.mock.calls[0][2] as string;
+      // Exact match — no title appended (FIX 2: prevents prompt injection via PR title)
+      expect(calledMessage).toBe('/workflow run my-reviewer');
+    });
+
+    test('pull_request.opened + enableAutoReview:true + empty allow-list → acquireLock NOT called', async () => {
+      // GITHUB_ALLOWED_USERS is not set (cleared in beforeEach) — auto-review must
+      // default-off to prevent unbounded AI cost from arbitrary webhook senders
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      const payload = createPullRequestOpenedPayload({
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
+      expect(mockHandleMessage).not.toHaveBeenCalled();
+    });
+
+    // --- Hardening: FIX A — idempotency / dedup on PR-open events ---
+    test('FIX-A: duplicate pull_request.opened for same PR on same adapter instance → acquireLock called exactly once', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      // Single adapter instance shares the recentAutoReviews map across both webhook calls.
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      const payload = createPullRequestOpenedPayload({
+        prNumber: 77,
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      // Second dispatch must be deduped — acquireLock called exactly once.
+      expect(mockLockManager.acquireLock).toHaveBeenCalledTimes(1);
+    });
+
+    // --- Hardening: FIX B — reject PR branch name starting with '-' ---
+    test('FIX-B: pull_request.opened with headRef starting with "-" → acquireLock NOT called', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      const payload = createPullRequestOpenedPayload({
+        headRef: '--inject-option',
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
+    });
+
+    // --- Hardening: FIX C — validate configured workflow name ---
+    test('FIX-C: invalid autoReviewWorkflow name (contains spaces/flags) falls back to default "agentic-eval-gate-pr"', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      // An attacker-controlled or misconfigured value with extra tokens must not reach the shell.
+      const adapter = createAutoReviewAdapter({
+        enableAutoReview: true,
+        autoReviewWorkflow: 'evil --no-worktree',
+      });
+      const payload = createPullRequestOpenedPayload({
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      expect(mockLockManager.acquireLock).toHaveBeenCalledTimes(1);
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+      const calledMessage = mockHandleMessage.mock.calls[0][2] as string;
+      // Must dispatch the safe default, not the attacker-controlled string.
+      expect(calledMessage).toBe('/workflow run agentic-eval-gate-pr');
+    });
+
+    // --- Loud-fail: a dispatch that breaks AFTER the skip-gates must never be silent ---
+    test('LOUD-FAIL: dispatch throws after passing gates → posts a framed "could not run" comment (not silent, not a pass)', async () => {
+      process.env.GITHUB_ALLOWED_USERS = 'developer';
+      const mockCreateComment = mock(() => Promise.resolve({ data: {} }));
+      const adapter = createAutoReviewAdapter({ enableAutoReview: true });
+      // Inject a mocked Octokit so the loud-fail comment can be asserted.
+      // @ts-expect-error - accessing private property for testing
+      adapter.octokit = { rest: { issues: { createComment: mockCreateComment } } };
+      // A missing/unloadable workflow, dead credential, or runtime failure all
+      // surface as a throw out of handleMessage — simulate that here.
+      mockHandleMessage.mockRejectedValueOnce(
+        new Error('Workflow `agentic-eval-gate-pr` not found')
+      );
+
+      const payload = createPullRequestOpenedPayload({
+        prNumber: 42,
+        headRepoFullName: 'testuser/testrepo',
+        baseRepoFullName: 'testuser/testrepo',
+        senderLogin: 'developer',
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      // The failure must NOT be silent — exactly one framed comment is posted.
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+      expect(mockCreateComment).toHaveBeenCalledTimes(1);
+      const body = mockCreateComment.mock.calls[0][0].body as string;
+      expect(body).toContain('could not run');
+      expect(body).toContain('NOT a passing review');
+      // And it must surface the underlying reason for the operator.
+      expect(body).toContain('not found');
     });
   });
 });

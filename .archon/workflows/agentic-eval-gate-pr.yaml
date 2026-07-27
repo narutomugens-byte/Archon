@@ -1,0 +1,384 @@
+name: agentic-eval-gate-pr
+description: |
+  Ambient, PR-ISOLATED read-only variant of `agentic-eval-gate`. Built to be
+  dispatched automatically on `pull_request.opened` by Archon's GitHub adapter
+  (the read-only ambient PR-review loop): it checks out the PR's head branch in
+  an isolated worktree and judges the PR diff two ways (the "New SDLC with vibe
+  coding" whitepaper discipline — "set the bar at the eval, not the demo"):
+
+    1. OUTPUT eval     — is the final result correct vs the spec / "done means"?
+    2. TRAJECTORY eval — was the path sound? Were required checks (tests, lint,
+                         type-check, error handling, security) ACTUALLY run, or
+                         skipped while still looking correct?
+
+  The gate RUNS the fast/safe checks itself rather than trusting the implementer's
+  summary. A change can pass the output eval and still FAIL the gate if the
+  trajectory skipped a required verification step.
+
+  Difference vs `agentic-eval-gate`: that one is for INTERACTIVE use and evaluates
+  the operator's LIVE working tree (`worktree.enabled: false`). This variant sets
+  `worktree.enabled: true` so the ambient dispatch isolates on the PR head branch
+  (the isolation hints carry prBranch/prSha), and the final `verdict` node emits a
+  human-readable Markdown PR comment instead of raw JSON.
+
+  Read-only: it never edits files, never merges, never pushes. `mutates_checkout:
+  false` also lets concurrent PR reviews on one repo run without serializing on
+  the path-lock.
+
+  Usage (ambient): the GitHub adapter passes the PR title as $ARGUMENTS (the spec)
+  and posts the verdict as a PR comment. With no message it falls back to
+  evaluating the diff against its own apparent intent.
+
+  Model routing (the paper's "routing as a financial lever"): bash nodes use no
+  model; the two evals use the `medium` tier (reasoning); the verdict uses `small`.
+
+tags: [eval, verification, gate, agentic-engineering, sdlc, pr-review, ambient]
+provider: claude
+mutates_checkout: false
+# Ambient PR review isolates on the PR head branch (unlike the interactive gate,
+# which evaluates the live tree). worktree.enabled: true makes the executor honor
+# the prBranch/prSha isolation hints from the pull_request.opened webhook.
+worktree:
+  enabled: true
+
+nodes:
+  # ─── 1. DIFF (deterministic, no AI) ───────────────────────────────────
+  # Robust diff that survives Windows worktrees and fresh single-commit checkouts.
+  # (Same hardened logic proven in cross-model-code-review.)
+  - id: get-diff
+    bash: |
+      # Hermetic git context: clear any GIT_DIR/GIT_WORK_TREE inherited from the
+      # environment so every git command below acts on THIS repo (the run's cwd),
+      # never a repo leaked via the env. The block just below re-sets GIT_DIR for
+      # Archon worktrees (where .git is a file). Without this, a stray GIT_DIR
+      # silently redirects the diff to the WRONG repo — a wrong/blind evaluation
+      # that still looks like a valid verdict.
+      unset GIT_DIR GIT_WORK_TREE
+      if [ -f .git ]; then
+        gitdir=$(sed -n 's/^gitdir: //p' .git)
+        if command -v cygpath >/dev/null 2>&1; then
+          export GIT_DIR=$(cygpath -u "$gitdir")
+        else
+          export GIT_DIR=$(echo "$gitdir" | sed 's|^\([A-Za-z]\):|/\L\1|; s|\\|/|g')
+        fi
+      fi
+
+      echo "=== BRANCH ==="
+      git branch --show-current
+
+      # Resolve base in-shell only. We deliberately do NOT use Archon's magic
+      # base-branch variable (its token, even inside a comment, forces eager base
+      # resolution before the node runs and hard-fails on repos with no `origin`,
+      # e.g. a local-only checkout). Optional plain override: EVAL_BASE. Otherwise
+      # origin/HEAD, else main. base-mode is only reached when the tree is clean
+      # anyway, so a missing base never blocks the gate.
+      BASE="${EVAL_BASE:-}"
+      [ -z "$BASE" ] && BASE=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+      case "$BASE" in ""|HEAD) BASE=main ;; esac
+      echo "=== BASE ==="
+      echo "base = $BASE"
+
+      HAS_PARENT="$(git rev-parse --verify --quiet HEAD~1 || true)"
+      EMPTY_TREE="$(git hash-object -t tree /dev/null)"
+
+      # Compute the diff WITHOUT a shell function. Archon runs bash nodes via
+      # `bash -c <script>`, and on Windows a multi-line function definition can
+      # fail to register in that subprocess ("run_diff: command not found"),
+      # which left the gate silently blind. Instead, try comparison modes in
+      # order of specificity and take the FIRST that yields a non-empty diff.
+      # Detecting worktree changes via the actual `git diff HEAD` (not
+      # `git status --porcelain`) also sidesteps the Windows autocrlf phantom:
+      # a line-ending-only "modification" makes porcelain non-empty but the diff
+      # empty, and now correctly falls through to a base/last/root comparison
+      # instead of reporting "NO CHANGES DETECTED".
+      MODE=""; LABEL=""; DIFF_OUT=""; NAMES=""
+
+      WT="$(git diff HEAD 2>/dev/null)"
+      if [ -n "$WT" ]; then
+        MODE=worktree; LABEL="(uncommitted working-tree changes vs HEAD)"
+        DIFF_OUT="$WT"; NAMES="$(git diff --name-only HEAD)"
+      elif git rev-parse --verify --quiet "origin/$BASE" >/dev/null && [ -n "$(git log --oneline "origin/$BASE..HEAD" 2>/dev/null)" ]; then
+        MODE=base; LABEL="(this branch vs origin/$BASE)"
+        DIFF_OUT="$(git diff "origin/$BASE...HEAD")"; NAMES="$(git diff --name-only "origin/$BASE...HEAD")"
+      elif [ -n "$HAS_PARENT" ]; then
+        MODE=last; LABEL="(fallback: last commit)"
+        DIFF_OUT="$(git diff HEAD~1..HEAD)"; NAMES="$(git diff --name-only HEAD~1..HEAD)"
+      else
+        MODE=root; LABEL="(root commit: full initial tree vs empty tree)"
+        DIFF_OUT="$(git diff "$EMPTY_TREE" HEAD)"; NAMES="$(git diff --name-only "$EMPTY_TREE" HEAD)"
+      fi
+
+      echo "=== DIFF ==="
+      echo "$LABEL"
+      if [ -n "$DIFF_OUT" ]; then
+        echo "$DIFF_OUT"
+      else
+        echo "NO CHANGES DETECTED - working tree clean and nothing to compare against."
+        echo "Evaluators: state there is nothing to evaluate; do not invent findings."
+      fi
+      echo "=== CHANGED FILES ==="
+      echo "$NAMES"
+
+  # ─── 2. RUN CHECKS (deterministic trajectory signal, no AI) ───────────
+  # "Run the eval, don't trust the demo." Executes only FAST, SAFE gates that
+  # actually exist (type-check, lint). Deliberately does NOT run the full test
+  # suite (slow; and on this repo the root `bun test` is forbidden — see
+  # CLAUDE.md) — it REPORTS that gap so the trajectory eval can weigh it.
+  # Always exits 0: it records results for the gate to judge, it is not the gate.
+  - id: run-checks
+    depends_on: [get-diff]
+    timeout: 600000
+    bash: |
+      if [ -f .git ]; then
+        gitdir=$(sed -n 's/^gitdir: //p' .git)
+        if command -v cygpath >/dev/null 2>&1; then
+          export GIT_DIR=$(cygpath -u "$gitdir")
+        else
+          export GIT_DIR=$(echo "$gitdir" | sed 's|^\([A-Za-z]\):|/\L\1|; s|\\|/|g')
+        fi
+      fi
+
+      TYPECHECK=skipped; LINT=skipped; TESTS=not-run
+
+      if [ -f package.json ]; then
+        have() { grep -q "\"$1\"" package.json; }
+        runner=npm; command -v bun >/dev/null 2>&1 && runner=bun
+
+        # Detect whether this review sandbox actually has installed dependencies.
+        # Archon isolates a PR in a fresh worktree that copies only `.archon` — it
+        # never installs node_modules. A type-check/lint that needs local tooling
+        # (tsc, eslint, workspace symlinks, @types) then fails for ENVIRONMENT
+        # reasons, not because the PR's code is wrong (confirmed: a bare Archon
+        # worktree fails type-check with "command not found: tsc" and lint with
+        # "Cannot find package '@eslint/js'"). Reporting that as `fail` would
+        # spuriously block EVERY good PR. So: run the check, but if it fails AND
+        # deps are absent, downgrade the result to `unavailable-no-deps`
+        # (UNVERIFIED) instead of `fail`. A dep-free check that passes still
+        # reports `pass`, so no real signal is lost.
+        DEPS=absent; [ -d node_modules ] && DEPS=present
+
+        if have 'type-check'; then
+          echo "=== type-check ==="
+          if $runner run type-check >/tmp/tc.log 2>&1; then
+            TYPECHECK=pass
+          elif [ "$DEPS" = absent ]; then
+            TYPECHECK=unavailable-no-deps
+            echo "(type-check FAILED but node_modules is absent in this review worktree — the failure is missing tooling/deps, not the PR. Reporting UNVERIFIED, not fail.)"
+          else
+            TYPECHECK=fail
+          fi
+          tail -30 /tmp/tc.log
+        fi
+        if have 'lint'; then
+          echo "=== lint ==="
+          if $runner run lint >/tmp/lint.log 2>&1; then
+            LINT=pass
+          elif [ "$DEPS" = absent ]; then
+            LINT=unavailable-no-deps
+            echo "(lint FAILED but node_modules is absent — reporting UNVERIFIED, not fail.)"
+          else
+            LINT=fail
+          fi
+          tail -30 /tmp/lint.log
+        fi
+        echo "NOTE: full test/validate suite intentionally NOT run by this gate (speed + root-test safety). The trajectory eval must treat test coverage as UNVERIFIED unless the diff itself adds/updates tests."
+      else
+        echo "No package.json — no JS gates to run. Trajectory eval should rely on the diff + spec only."
+      fi
+
+      echo "=== CHECKS SUMMARY ==="
+      echo "{\"type_check\":\"$TYPECHECK\",\"lint\":\"$LINT\",\"tests\":\"$TESTS\"}"
+
+  # ─── 3. OUTPUT EVAL (reasoning) ───────────────────────────────────────
+  # "Is the final result correct?" — vs the spec's acceptance criteria.
+  - id: output-eval
+    depends_on: [get-diff]
+    model: medium
+    context: fresh
+    allowed_tools: [Read, Grep, Glob, Bash]
+    retry:
+      max_attempts: 2
+      delay_ms: 3000
+      on_error: transient
+    prompt: |
+      You are an OUTPUT evaluator. Decide whether the change below actually
+      satisfies its specification — not whether it looks plausible. Verify against
+      the real code: open changed files, run targeted read-only checks if useful.
+      Do NOT edit anything.
+
+      ## Spec / acceptance criteria (may be terse or empty)
+      $ARGUMENTS
+
+      ## Diff under evaluation
+      $get-diff.output
+
+      ## How to judge
+      - Derive concrete acceptance criteria from the spec. If the spec is empty,
+        infer the change's apparent intent from the diff and judge against that.
+      - For EACH criterion decide met / not-met / partial, and cite file:line
+        evidence you actually verified (not a guess).
+      - If there are no changes to evaluate, return verdict "fail" with a single
+        criterion explaining there was nothing to evaluate.
+    output_format:
+      type: object
+      properties:
+        verdict:
+          type: string
+          enum: [pass, partial, fail]
+        criteria:
+          type: array
+          items:
+            type: object
+            properties:
+              criterion: { type: string }
+              status:
+                type: string
+                enum: [met, partial, not-met]
+              evidence: { type: string }
+            required: [criterion, status]
+        summary: { type: string }
+      required: [verdict, summary]
+
+  # ─── 4. TRAJECTORY EVAL (reasoning) ───────────────────────────────────
+  # "Was the path sound?" — were required checks actually run, or skipped?
+  - id: trajectory-eval
+    depends_on: [get-diff, run-checks]
+    model: medium
+    context: fresh
+    allowed_tools: [Read, Grep, Glob, Bash]
+    retry:
+      max_attempts: 2
+      delay_ms: 3000
+      on_error: transient
+    prompt: |
+      You are a TRAJECTORY evaluator. A change can be correct-looking yet unsound
+      because required verification was skipped. Judge the PROCESS, not just the
+      output. Do NOT edit anything.
+
+      ## Spec (may be empty)
+      $ARGUMENTS
+
+      ## Diff
+      $get-diff.output
+
+      ## Deterministic gate results (type-check / lint actually executed by the gate)
+      $run-checks.output
+
+      ## What to flag as a skipped/unsound step
+      - New or changed behavior with NO added/updated tests IN THE DIFF — flag it.
+        IMPORTANT: the gate does NOT execute the test suite by design, so do NOT
+        treat "the tests weren't run" as a defect. Tests PRESENT in the diff that
+        cover the changed behavior SATISFY the coverage requirement — judge them by
+        READING them, not by whether they executed. Only genuinely ABSENT tests for
+        changed behavior are a flag here.
+      - type-check or lint reported "fail" above (deps were installed and the
+        check actually ran — a genuine failure). NOTE: the status
+        "unavailable-no-deps" is NOT a failure and NOT a hollow check — it means a
+        REAL check could not execute because the review sandbox had no installed
+        dependencies; weigh it exactly like the untested-suite case above
+        (UNVERIFIED). Every other soundness rule here still applies in full.
+      - HOLLOW / STUBBED checks: a reported "pass" is only meaningful if the check
+        actually verifies something. Open package.json and inspect the
+        `type-check`, `lint`, and `test` scripts. If any is a no-op or stub —
+        `echo ...`, `true`, `exit 0`, `:`, an empty command, or anything that does
+        not invoke a real checker (tsc, eslint, a genuine test runner / script) —
+        then its "pass" is FAKE. Treat a passing-but-hollow check as UNVERIFIED,
+        and flag the stubbed check itself as an unsound, misleading step. This is
+        the canonical "skipped while still looking correct" case this eval exists
+        to catch — do not take a green check on trust without confirming it is real.
+      - New error paths swallowed, or new external input unvalidated.
+      - Security-sensitive surface (auth, file paths, secrets, shell, SQL) touched
+        without a corresponding guard.
+      List every skipped/unsound step concretely with file:line where relevant.
+
+      ## How to conclude soundness
+      Conclude "sound" when the change is correct AND its behavior is covered by
+      tests present in the diff AND none of the flags above genuinely apply.
+      Checks reported "unavailable-no-deps" (a real check the sandbox could not
+      run) and the gate's by-design non-execution of the test suite are NOT, by
+      themselves, grounds for "unsound" — a clean, well-tested diff is SOUND even
+      when the sandbox could not execute its tooling. Reserve "unsound" for genuine
+      gaps: ABSENT tests for changed behavior, a real check FAILURE (deps present),
+      stubbed/hollow checks, swallowed errors, or an unguarded security surface.
+    output_format:
+      type: object
+      properties:
+        soundness:
+          type: string
+          enum: [sound, unsound]
+        skipped_checks:
+          type: array
+          items: { type: string }
+        risks:
+          type: array
+          items: { type: string }
+        summary: { type: string }
+      required: [soundness, summary]
+
+  # ─── 5. GATE DECISION (deterministic — NOT delegated to an LLM) ───────────
+  # PASS iff output-eval verdict == "pass" AND trajectory soundness == "sound".
+  # A small model re-deriving this boolean from prose was observed to flip a
+  # legitimate PASS to FAIL, so the decision is computed here in bash; the verdict
+  # node only writes the comment for the decision it is handed. printf (no newline)
+  # so the value substitutes cleanly into the Markdown header.
+  - id: gate-decision
+    depends_on: [output-eval, trajectory-eval]
+    bash: |
+      # Archon already shell-quotes each `$node.output.field` substitution, so the
+      # tokens are assigned WITHOUT surrounding quotes (double-quoting a pre-quoted
+      # value yields the literal wrong string). Our own $V/$S are quoted normally.
+      V=$output-eval.output.verdict
+      S=$trajectory-eval.output.soundness
+      if [ "$V" = "pass" ] && [ "$S" = "sound" ]; then
+        printf 'PASS'
+      else
+        printf 'FAIL'
+      fi
+
+  # ─── 6. VERDICT (writes the Markdown PR comment for the computed decision) ──
+  - id: verdict
+    depends_on: [gate-decision, output-eval, trajectory-eval]
+    model: small
+    context: fresh
+    allowed_tools: []
+    prompt: |
+      You write the PR-review comment (posted verbatim as a GitHub PR comment).
+      You do NOT decide PASS/FAIL — the gate decision was already computed
+      deterministically upstream and is handed to you below. Use it VERBATIM in the
+      header, and write prose that is consistent with it (do not argue for a
+      different outcome).
+
+      GATE DECISION (authoritative, computed upstream): $gate-decision.output
+
+      GROUNDING CONSTRAINT (critical): ANY file paths, symbol names, or line
+      references you mention MUST be taken verbatim from the `output-eval` and
+      `trajectory-eval` findings provided below. You are aggregating and restating
+      their findings into a final verdict; you do NOT inspect the code yourself.
+      Do NOT introduce any file name, path, or code detail that does not appear in
+      those upstream evaluations. If the upstream findings don't name a specific
+      file, don't name one.
+
+      ## Output eval
+      verdict: $output-eval.output.verdict
+      $output-eval.output.summary
+
+      ## Trajectory eval
+      soundness: $trajectory-eval.output.soundness
+      $trajectory-eval.output.summary
+
+      Write the comment in EXACTLY this Markdown shape (fill the angle-bracket
+      slots; include the "Blocking reasons" section ONLY when the decision is FAIL,
+      drop it entirely when PASS):
+
+      ## 🤖 Archon PR Review — Gate: $gate-decision.output
+
+      <one or two sentence overall rationale, grounded in the findings above>
+
+      **Blocking reasons**
+      - <blocking reason 1>
+      - <blocking reason 2>
+
+      **Recommendation:** <concrete next step, or "Looks ready — no blocking issues found." when PASS>
+
+      ---
+      _Automated read-only review (output + trajectory eval). This is a comment, not a merge gate._
