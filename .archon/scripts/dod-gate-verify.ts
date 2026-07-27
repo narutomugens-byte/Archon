@@ -995,6 +995,26 @@ try {
   record('Scope-self-scoped', false, `harness error: ${(e as Error).message}`);
 }
 
+// ── Meta: DEFAULT_TEST_GLOBS must keep at least one fixture's coverage ────────
+// v1.11 layer-level guard, not a fixture. The pre-v1.11 JavaScript gap survived
+// 43/43 green purely because EVERY fixture pinned `test_globs` in its own spec, so
+// the default constant was never once executed — the suite was green about a code
+// path it never ran. Pinning is the convenient default when adding a fixture, so
+// that coverage will erode again unless losing it is itself a failure. This turns
+// "the default is untested" from an invisible blind spot into a red harness.
+{
+  const usingDefault = FIXTURES.filter(
+    (f) => !Object.prototype.hasOwnProperty.call((f.spec ?? COMMON_SPEC) as object, 'test_globs')
+  );
+  record(
+    'Meta-default-test-globs-covered',
+    usingDefault.length > 0,
+    usingDefault.length > 0
+      ? `${usingDefault.length} fixture(s) omit test_globs, so DEFAULT_TEST_GLOBS is exercised: ${usingDefault.map((f) => f.name).join(', ')}`
+      : 'NO fixture omits test_globs — DEFAULT_TEST_GLOBS has zero coverage. Add a fixture that leaves it unset.'
+  );
+}
+
 // ── summary ───────────────────────────────────────────────────────────────────
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} acceptance cases behaved as required.`);
