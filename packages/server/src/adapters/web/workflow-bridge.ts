@@ -182,6 +182,20 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'node_fallback_triggered':
+      return JSON.stringify({
+        type: 'workflow_node_fallback',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        nodeName: event.nodeName,
+        fromProvider: event.fromProvider,
+        ...(event.fromModel !== undefined ? { fromModel: event.fromModel } : {}),
+        toProvider: event.toProvider,
+        ...(event.toModel !== undefined ? { toModel: event.toModel } : {}),
+        reason: event.reason,
+        timestamp: Date.now(),
+      });
+
     case 'container_lifecycle':
       return JSON.stringify({
         type: 'workflow_container_lifecycle',

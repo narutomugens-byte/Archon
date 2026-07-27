@@ -90,6 +90,33 @@ export function classifyError(error: Error): ErrorType {
 }
 
 /**
+ * Quota / limit-window exhaustion substrings — a SUBSET of FATAL_PATTERNS, kept as a
+ * SEPARATE constant so classifyError's FATAL-vs-TRANSIENT precedence (#2181) is never
+ * touched by this addition. Used ONLY to mark a failed node fallback-eligible
+ * (NodeOutput.failureReason: 'quota' — see node-fallback-repair-design.md §6);
+ * classification of the run-killing decision still flows entirely through
+ * FATAL_PATTERNS/classifyError, unchanged.
+ *
+ * INVARIANT: every entry here MUST also appear in FATAL_PATTERNS — enforced by a
+ * drift-guard test in executor-shared.test.ts.
+ */
+export const QUOTA_LIMIT_PATTERNS = [
+  'session limit',
+  'usage limit reached',
+  'credit exhaustion',
+  'credit balance',
+];
+
+/**
+ * Check whether an error message indicates quota/session-limit exhaustion — the
+ * fallback-eligibility subset of FATAL. Deliberately separate from classifyError so it
+ * can be added without touching FATAL-vs-TRANSIENT precedence.
+ */
+export function isQuotaLimitError(message: string): boolean {
+  return matchesPattern(message.toLowerCase(), QUOTA_LIMIT_PATTERNS);
+}
+
+/**
  * Map the retry-oriented {@link ErrorType} to the telemetry wire enum. The
  * telemetry event carries ONLY this fixed-enum class — never error text.
  */

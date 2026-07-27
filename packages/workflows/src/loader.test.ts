@@ -2471,6 +2471,158 @@ nodes:
     });
   });
 
+  describe('fallback field parsing', () => {
+    it('accepts fallback: on a command node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'fallback-command.yaml'),
+        `
+name: fallback-command
+description: Command node with fallback
+nodes:
+  - id: implement
+    command: my-cmd
+    fallback: large
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      const wf = result.workflows[0].workflow;
+      expect(wf.nodes[0].fallback).toBe('large');
+    });
+
+    it('accepts fallback: on a prompt node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'fallback-prompt.yaml'),
+        `
+name: fallback-prompt
+description: Prompt node with fallback
+nodes:
+  - id: summarise
+    prompt: "Summarise the changes"
+    fallback: "@resilient"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      const wf = result.workflows[0].workflow;
+      expect(wf.nodes[0].fallback).toBe('@resilient');
+    });
+
+    it('accepts a workflow-level fallback default', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'fallback-workflow-level.yaml'),
+        `
+name: fallback-workflow-level
+description: Workflow-level fallback default
+fallback: "@resilient"
+nodes:
+  - id: implement
+    command: my-cmd
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      const wf = result.workflows[0].workflow as { fallback?: unknown };
+      expect(wf.fallback).toBe('@resilient');
+    });
+
+    it.each([
+      ['bash', 'bash: "echo hi"'],
+      ['script', 'script: "console.log(1)"\n    runtime: bun'],
+      ['approval', 'approval:\n      message: "Please review"'],
+      ['loop', 'loop:\n      prompt: "Iterate."\n      until: DONE\n      max_iterations: 3'],
+      [
+        'loop_group',
+        'loop_group:\n      until: DONE\n      max_iterations: 2\n      nodes:\n        - id: inner\n          command: inner-cmd',
+      ],
+    ])('rejects fallback: on a %s node', async (nodeType, nodeBody) => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, `fallback-reject-${nodeType}.yaml`),
+        `
+name: fallback-reject-${nodeType}
+description: fallback rejected on ${nodeType} node
+nodes:
+  - id: my-node
+    ${nodeBody}
+    fallback: large
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].errorType).toBe('validation_error');
+      expect(result.errors[0].error).toContain("'fallback' is only valid on command/prompt");
+      expect(result.errors[0].error).toContain(nodeType);
+    });
+
+    it('rejects fallback: on a cancel node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'fallback-reject-cancel.yaml'),
+        `
+name: fallback-reject-cancel
+description: fallback rejected on cancel node
+nodes:
+  - id: bail
+    cancel: "stop here"
+    fallback: large
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].errorType).toBe('validation_error');
+      expect(result.errors[0].error).toContain("'fallback' is only valid on command/prompt");
+      expect(result.errors[0].error).toContain('cancel');
+    });
+
+    it('rejects fallback: on a bash node nested inside a loop_group body (Finding #3)', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'fallback-reject-loop-group-body.yaml'),
+        `
+name: fallback-reject-loop-group-body
+description: fallback rejected on a bash node nested in a loop_group body
+nodes:
+  - id: outer-loop
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: inner-bash
+          bash: "echo hi"
+          fallback: large
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].errorType).toBe('validation_error');
+      expect(result.errors[0].error).toContain("'fallback' is only valid on command/prompt");
+      expect(result.errors[0].error).toContain('bash');
+      expect(result.errors[0].error).toContain('inner-bash');
+    });
+  });
+
   describe('loop node parsing', () => {
     it('should parse a valid loop node with all fields', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');

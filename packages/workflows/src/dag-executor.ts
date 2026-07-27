@@ -93,6 +93,7 @@ import {
   classifyError,
   toTelemetryErrorClass,
   detectCreditExhaustion,
+  isQuotaLimitError,
   loadCommandPrompt,
   substituteWorkflowVariables,
   buildPromptWithContext,
@@ -298,6 +299,10 @@ interface WorkflowLevelOptions {
   /** Workflow-level tier keyword (when `workflow.model` is small/medium/large), so
    *  nodes that inherit the workflow model can still surface the `← tier` annotation. */
   workflowTier?: 'small' | 'medium' | 'large';
+  /** Workflow-level default for the engine-level cross-provider `fallback:`. A
+   *  node-level `node.fallback` overrides this. Distinct from `fallbackModel` above
+   *  (Claude-SDK-internal). See node-fallback-repair-design.md. */
+  fallback?: string;
 }
 
 /** Internal node execution result — extends NodeOutput with cost data for aggregation. */
@@ -628,6 +633,225 @@ async function runNodeRetryLoop<T extends NodeOutput>(
 }
 
 /**
+ * Structural (not string-matching) fallback-eligibility check — see
+ * node-fallback-repair-design.md §6. Only a failed output carrying a `failureReason`
+ * (set precisely at the two write seams in {@link executeNodeInternal}) is eligible.
+ * Deliberately NOT eligible: plain TRANSIENT (same-provider retry already handles it),
+ * cancel-by-user, and auth/permission FATAL (a different provider's credentials aren't
+ * addressed by this feature — out of v1 scope, see design §6/§11).
+ */
+function isFallbackEligible(output: NodeOutput): boolean {
+  return output.state === 'failed' && output.failureReason !== undefined;
+}
+
+/**
+ * Run a command/prompt node through the normal same-provider path
+ * ({@link runNodeRetryLoop}, UNCHANGED) and, if it fails with a fallback-eligible
+ * error AND `fallback:` is configured (node-level, falling back to the workflow-level
+ * default), re-resolve the fallback provider via the EXISTING
+ * {@link resolveNodeProviderAndModel} and re-dispatch the node ONCE on it before
+ * giving up. Fail-fast is preserved: if the fallback attempt also fails, its output
+ * (not the primary's) is returned — the run fails.
+ *
+ * Only called from the command/prompt AI-node call site in {@link runLayers}.
+ * Deterministic (bash/script) and loop/loop_group nodes dispatch through their own
+ * paths earlier in {@link runLayers} and never reach this wrapper. See
+ * node-fallback-repair-design.md §5 for the full design and Finding #1 for why the
+ * scope is command/prompt only.
+ */
+async function runNodeWithFallback(
+  node: CommandNode | PromptNode,
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  workflowRun: WorkflowRun,
+  workflowProvider: string,
+  workflowModel: string | undefined,
+  config: WorkflowConfig,
+  workflowLevelOptions: WorkflowLevelOptions,
+  aiProfile: ResolvedAiProfile | undefined,
+  workflowPreset: ModelAliasPreset | undefined,
+  execContext: ExecutionContext,
+  primaryProvider: string,
+  primaryModel: string | undefined,
+  artifactsDir: string,
+  logDir: string,
+  baseBranch: string,
+  docsDir: string,
+  nodeOutputs: Map<string, NodeOutput>,
+  configuredCommandFolder: string | undefined,
+  issueContext: string | undefined,
+  stepNamePrefix: string,
+  iteration: number | undefined,
+  primaryRun: () => Promise<NodeExecutionResult>
+): Promise<{ output: NodeExecutionResult; actualProvider: string }> {
+  const initialOutput: NodeExecutionResult = {
+    state: 'failed',
+    output: '',
+    error: 'Node did not execute',
+  };
+
+  const output = await runNodeRetryLoop(
+    node,
+    platform,
+    conversationId,
+    workflowRun,
+    getEffectiveNodeRetryConfig(node),
+    primaryRun,
+    initialOutput
+  );
+
+  const fallbackRef = node.fallback ?? workflowLevelOptions.fallback;
+  if (output.state !== 'failed' || !fallbackRef || !isFallbackEligible(output)) {
+    return { output, actualProvider: primaryProvider };
+  }
+  // Redundant with isFallbackEligible above, but written as a direct field
+  // comparison (rather than relying on the opaque boolean-returning helper) so
+  // TypeScript narrows `output.failureReason` to a concrete union member below.
+  if (output.failureReason === undefined) {
+    return { output, actualProvider: primaryProvider };
+  }
+  const reason = output.failureReason;
+
+  // Re-resolve the fallback provider/model via the EXISTING resolver — a shallow
+  // clone of the node with `model` swapped to the fallback ref. `node.provider` is
+  // deliberately kept: a bare-literal fallback (no tier/alias) then resolves on the
+  // SAME provider as the primary node (matching `model:` grammar), which the
+  // same-provider guard below correctly treats as a no-op rather than a wasted
+  // cross-provider attempt.
+  const fallbackNode = { ...node, model: fallbackRef } as CommandNode | PromptNode;
+  const fb = await resolveNodeProviderAndModel(
+    fallbackNode,
+    workflowProvider,
+    workflowModel,
+    config,
+    platform,
+    conversationId,
+    workflowRun.id,
+    cwd,
+    workflowLevelOptions,
+    aiProfile,
+    workflowPreset,
+    execContext,
+    // Suppress dag.model_provider_conflict — a cross-provider fallback
+    // intentionally keeps node.provider while resolving a different provider
+    // from fallbackRef; that's the feature working, not a misconfiguration
+    // (Finding #4).
+    true
+  );
+
+  if (fb.provider === primaryProvider) {
+    // "Warn loudly" (design §7) — mirrors the dag.model_provider_conflict posture:
+    // a same-provider fallback is pointless for quota (that's why quota is FATAL in
+    // the first place) and usually a mistake, so surface it to the user, not just
+    // the logs.
+    getLog().warn(
+      { nodeId: node.id, provider: primaryProvider, fallbackRef },
+      'dag.node_fallback_same_provider_skipped'
+    );
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `Warning: Node '${node.id}' failed on **${primaryProvider}** but its \`fallback: ${fallbackRef}\` also resolves to **${primaryProvider}** — skipping the pointless same-provider retry.`,
+      { workflowId: workflowRun.id, nodeName: node.id }
+    );
+    return { output, actualProvider: primaryProvider };
+  }
+
+  getWorkflowEventEmitter().emit({
+    type: 'node_fallback_triggered',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.command ?? node.id,
+    fromProvider: primaryProvider,
+    ...(primaryModel !== undefined ? { fromModel: primaryModel } : {}),
+    toProvider: fb.provider,
+    ...(fb.model !== undefined ? { toModel: fb.model } : {}),
+    reason,
+  });
+  getLog().warn(
+    {
+      nodeId: node.id,
+      fromProvider: primaryProvider,
+      fromModel: primaryModel,
+      toProvider: fb.provider,
+      toModel: fb.model,
+      reason,
+    },
+    'dag.node_fallback_triggered'
+  );
+  await safeSendMessage(
+    platform,
+    conversationId,
+    `⚠️ Node \`${node.id}\` failed (${reason}) on **${primaryProvider}** — falling back to **${fb.provider}**...`,
+    { workflowId: workflowRun.id, nodeName: node.id }
+  );
+
+  const fallbackOutput = await runNodeRetryLoop(
+    node,
+    platform,
+    conversationId,
+    workflowRun,
+    getEffectiveNodeRetryConfig(node),
+    () =>
+      executeNodeInternal(
+        deps,
+        platform,
+        conversationId,
+        cwd,
+        workflowRun,
+        node,
+        fb.provider,
+        fb.options,
+        artifactsDir,
+        logDir,
+        baseBranch,
+        docsDir,
+        nodeOutputs,
+        // Fresh session: a session id can only be resumed by the provider that
+        // created it (#1992) — the fallback provider is, by the guard above,
+        // always different from the primary.
+        undefined,
+        configuredCommandFolder,
+        issueContext,
+        fb.model,
+        fb.tier,
+        stepNamePrefix,
+        iteration
+      ),
+    initialOutput
+  );
+  // executeNodeInternal computes costUsd/tokens even for a failed primary
+  // attempt (schema_miss can burn up to 4x calls before failing) — sum the
+  // primary attempt's cost/tokens into the final result so total spend
+  // reflects BOTH attempts, regardless of whether the fallback itself
+  // succeeds (node-fallback-repair-design.md §7, Finding #2).
+  const combinedCostUsd =
+    output.costUsd !== undefined || fallbackOutput.costUsd !== undefined
+      ? (output.costUsd ?? 0) + (fallbackOutput.costUsd ?? 0)
+      : undefined;
+  const combinedTokens =
+    output.tokens !== undefined || fallbackOutput.tokens !== undefined
+      ? {
+          input: (output.tokens?.input ?? 0) + (fallbackOutput.tokens?.input ?? 0),
+          output: (output.tokens?.output ?? 0) + (fallbackOutput.tokens?.output ?? 0),
+        }
+      : undefined;
+  // The session actually came from the fallback provider — tag it as such so
+  // the caller persists/resumes under the RIGHT provider, not the primary
+  // `primaryProvider` const (#1992, node-fallback-repair-design.md §7, Finding #1).
+  return {
+    output: {
+      ...fallbackOutput,
+      ...(combinedCostUsd !== undefined ? { costUsd: combinedCostUsd } : {}),
+      ...(combinedTokens !== undefined ? { tokens: combinedTokens } : {}),
+    },
+    actualProvider: fb.provider,
+  };
+}
+
+/**
  * Run a deterministic (bash/script) node with opt-in retry.
  *
  * Deterministic nodes get exactly one attempt unless they declare an explicit
@@ -911,7 +1135,14 @@ async function resolveNodeProviderAndModel(
   workflowLevelOptions: WorkflowLevelOptions,
   aiProfile?: ResolvedAiProfile,
   workflowPreset?: ModelAliasPreset,
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  // Set only by runNodeWithFallback's re-resolution of a synthesized fallback
+  // node (node.provider intentionally kept, model swapped to the fallback ref
+  // — see its comment). That combination is expected to diverge by design when
+  // the fallback resolves to a different provider, so the conflict warning
+  // would be spurious noise on the feature's primary use case
+  // (node-fallback-repair-design.md §7, Finding #4).
+  suppressProviderConflictWarning = false
 ): Promise<{
   provider: string;
   model: string | undefined;
@@ -932,7 +1163,7 @@ async function resolveNodeProviderAndModel(
         preset = modelSpec;
         provider = modelSpec.provider;
         model = modelSpec.model;
-        if (node.provider && node.provider !== provider) {
+        if (node.provider && node.provider !== provider && !suppressProviderConflictWarning) {
           getLog().warn(
             {
               nodeId: node.id,
@@ -1211,6 +1442,15 @@ export function buildTopologicalLayers(nodes: readonly DagNode[]): DagNode[][] {
 
   return layers;
 }
+
+/**
+ * Thrown by the structured-output path when `output_format` can't be satisfied
+ * (schema-invalid payload after re-asks exhausted, or no structured output at all).
+ * Caught in executeNodeInternal's failure handler to set
+ * `NodeOutput.failureReason: 'schema_miss'` precisely — via `instanceof`, not message
+ * string-matching — for fallback eligibility (node-fallback-repair-design.md §6).
+ */
+class StructuredOutputSchemaError extends Error {}
 
 /**
  * Execute a single DAG node. Returns NodeExecutionResult regardless of success/failure.
@@ -2017,7 +2257,7 @@ async function executeNodeInternal(
           await scheduleReask(validation.errors);
           continue;
         }
-        throw new Error(
+        throw new StructuredOutputSchemaError(
           `Node '${node.id}': output_format declared but the provider's structured output failed schema validation: ${validation.errors.join('; ')}`
         );
       }
@@ -2038,7 +2278,7 @@ async function executeNodeInternal(
           `Node '${node.id}': timed out (no output for ${String(effectiveIdleTimeout / 60000)} min) before producing the required structured output.`
         );
       }
-      throw new Error(
+      throw new StructuredOutputSchemaError(
         `Node '${node.id}': output_format declared but the provider returned no schema-valid structured output. ` +
           'The model likely replied with prose, refused, or emitted unparseable JSON.'
       );
@@ -2136,7 +2376,16 @@ async function executeNodeInternal(
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: nodeOutputText, error: creditError };
+      // Streamed-text quota detection bypasses the catch block below (this is a direct
+      // return, not a throw), so the fallback-eligibility marker must be set here too —
+      // detectCreditExhaustion's synthesized creditError always matches
+      // QUOTA_LIMIT_PATTERNS (node-fallback-repair-design.md Finding #2).
+      return {
+        state: 'failed',
+        output: nodeOutputText,
+        error: creditError,
+        failureReason: 'quota',
+      };
     }
 
     // Fail for zero output: covers both silent non-timeout exits AND idle-timeout before first token (time-to-first-token exceeded the window).
@@ -2284,12 +2533,25 @@ async function executeNodeInternal(
       error: err.message,
     });
 
+    // Structural fallback-eligibility marker (node-fallback-repair-design.md §6):
+    // `schema_miss` is precise (instanceof, no string-matching); `quota` is the
+    // thrown-quota backstop for a quota error the SDK raised as an exception rather
+    // than surfacing in streamed text (that path is marked separately at the
+    // detectCreditExhaustion direct return above).
+    const failureReason: 'quota' | 'schema_miss' | undefined =
+      error instanceof StructuredOutputSchemaError
+        ? 'schema_miss'
+        : isQuotaLimitError(err.message)
+          ? 'quota'
+          : undefined;
+
     return {
       state: 'failed',
       output: '',
       error: err.message,
       costUsd: nodeCostUsd,
       ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      ...(failureReason ? { failureReason } : {}),
     };
   }
 }
@@ -5915,12 +6177,34 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // 6. Execute with retry for transient failures. AI nodes get the
           // default 2 transient retries; the shared loop applies the same
           // backoff + FATAL-never-retried semantics as deterministic nodes.
-          const output = await runNodeRetryLoop(
+          // runNodeWithFallback wraps this same-provider path UNCHANGED and, only on
+          // a fallback-eligible failure with `fallback:` configured, re-dispatches
+          // once on a different provider (node-fallback-repair-design.md §5).
+          const { output, actualProvider } = await runNodeWithFallback(
             node,
+            deps,
             platform,
             conversationId,
+            cwd,
             workflowRun,
-            getEffectiveNodeRetryConfig(node),
+            workflowProvider,
+            workflowModel,
+            config,
+            workflowLevelOptions,
+            aiProfile,
+            workflowPreset,
+            execContext,
+            provider,
+            resolvedNodeModel,
+            artifactsDir,
+            logDir,
+            baseBranch,
+            docsDir,
+            ctx.nodeOutputs,
+            configuredCommandFolder,
+            issueContext,
+            stepNamePrefix,
+            iteration,
             () =>
               executeNodeInternal(
                 deps,
@@ -5946,8 +6230,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 resolvedTier,
                 stepNamePrefix,
                 iteration
-              ),
-            { state: 'failed', output: '', error: 'Node did not execute' } as NodeExecutionResult
+              )
           );
 
           // Cold-resume surfacing: this node requested a session resume but the
@@ -6002,7 +6285,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   workflow_name: workflowName,
                   node_id: node.id,
                   scope_key: persistScopeKey,
-                  provider,
+                  provider: actualProvider,
                   provider_session_id: output.sessionId,
                   last_run_id: workflowRun.id,
                 });
@@ -6015,7 +6298,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   workflow_name: workflowName,
                   scope_key: persistScopeKey,
                   node_id: node.id,
-                  provider,
+                  provider: actualProvider,
                 });
               }
             } catch (err) {
@@ -6028,20 +6311,20 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   nodeId: node.id,
                   workflow: workflowName,
                   scopeKey: persistScopeKey,
-                  provider,
+                  provider: actualProvider,
                 },
                 'persist_session_upsert_failed'
               );
               await safeSendMessage(
                 platform,
                 conversationId,
-                `⚠️ Could not persist the session for node \`${node.id}\` (${provider}). The next run will start this node fresh.`,
+                `⚠️ Could not persist the session for node \`${node.id}\` (${actualProvider}). The next run will start this node fresh.`,
                 { workflowId: workflowRun.id, nodeName: node.id }
               );
             }
           }
 
-          return { nodeId: node.id, output, sessionProvider: provider };
+          return { nodeId: node.id, output, sessionProvider: actualProvider };
         } catch (error) {
           const err = error as Error;
           getLog().error({ err, nodeId: node.id }, 'dag_node_pre_execution_failed');
@@ -6770,6 +7053,7 @@ export async function executeDagWorkflow(
     betas: workflow.betas,
     sandbox: workflow.sandbox,
     workflowTier,
+    fallback: workflow.fallback,
   };
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();

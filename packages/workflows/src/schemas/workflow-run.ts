@@ -91,6 +91,15 @@ export const nodeOutputSchema = z.discriminatedUnion('state', [
     error: z.string(),
     structuredOutput: z.unknown().optional(),
     declaredFields: z.array(z.string()).optional(),
+    /**
+     * Structural fallback-eligibility discriminant (node-fallback-repair-design.md §6).
+     * Set precisely at the failure site — 'quota' for a quota/session-limit exhaustion
+     * (thrown or detected in streamed text), 'schema_miss' for an output_format node
+     * whose provider couldn't produce schema-valid output after re-asks. `undefined`
+     * for every other failure (transient errors, cancel-by-user, auth/permission FATAL,
+     * etc.) — those are NOT fallback-eligible.
+     */
+    failureReason: z.enum(['quota', 'schema_miss']).optional(),
   }),
   z.object({
     state: z.enum(['pending', 'skipped']),

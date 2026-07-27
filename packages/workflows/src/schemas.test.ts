@@ -403,6 +403,39 @@ describe('dagNodeSchema — new Claude SDK options', () => {
       expect((result.data as PromptNode).fallbackModel).toBe('claude-haiku-4-5-20251001');
   });
 
+  test('parses fallback string on a prompt node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'n',
+      prompt: 'do it',
+      fallback: 'large',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect((result.data as PromptNode).fallback).toBe('large');
+  });
+
+  test('parses fallback string on a command node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'n',
+      command: 'build',
+      fallback: '@resilient',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect((result.data as CommandNode).fallback).toBe('@resilient');
+  });
+
+  test('rejects empty fallback string', () => {
+    const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', fallback: '' });
+    expect(result.success).toBe(false);
+  });
+
+  test('BASH_NODE_AI_FIELDS does not list fallback — it is load-time REJECTED on non-AI nodes, not warned', () => {
+    // Deliberate: fallback is stricter than the other AI-only fields (loader.ts
+    // hard-rejects it on non-command/prompt nodes rather than warn-and-drop).
+    // If it were also added here it would silently ride along ignored instead —
+    // see node-fallback-repair-design.md §7, Finding #3.
+    expect(BASH_NODE_AI_FIELDS).not.toContain('fallback');
+  });
+
   test('parses settingSources array of valid sources', () => {
     const result = dagNodeSchema.safeParse({
       id: 'n',
@@ -453,6 +486,22 @@ describe('dagNodeSchema — new Claude SDK options', () => {
       // bash nodes don't get AI-only fields in the transform
       expect('effort' in result.data).toBe(false);
       expect('thinking' in result.data).toBe(false);
+    }
+  });
+
+  test('schema-parses (but strips) fallback on a bash node — loader.ts is what rejects it', () => {
+    // dagNodeSchema itself is permissive (fallback lives on the shared base schema,
+    // like fallbackModel); the transform never carries it onto a BashNode. The HARD
+    // reject for fallback on non-AI nodes happens one layer up, in loader.ts's
+    // parseDagNode (see loader.test.ts 'fallback field parsing').
+    const result = dagNodeSchema.safeParse({
+      id: 'b',
+      bash: 'echo hi',
+      fallback: 'large',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect('fallback' in result.data).toBe(false);
     }
   });
 });

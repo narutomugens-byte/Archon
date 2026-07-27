@@ -30,6 +30,8 @@ import {
   classifyError,
   toTelemetryErrorClass,
   safeSendMessage,
+  isQuotaLimitError,
+  QUOTA_LIMIT_PATTERNS,
   type UnknownErrorTracker,
 } from './executor-shared';
 
@@ -691,6 +693,36 @@ describe('classifyError', () => {
 
   it('classifies unknown errors as UNKNOWN', () => {
     expect(classifyError(new Error('something completely unexpected happened'))).toBe('UNKNOWN');
+  });
+});
+
+describe('isQuotaLimitError', () => {
+  it('returns true for each documented quota substring', () => {
+    expect(isQuotaLimitError('session limit reached')).toBe(true);
+    expect(isQuotaLimitError('Claude AI usage limit reached|1751234567')).toBe(true);
+    expect(isQuotaLimitError('Credit exhaustion detected — resume when credits reset')).toBe(true);
+    expect(isQuotaLimitError('your credit balance is too low')).toBe(true);
+  });
+
+  it('is case-insensitive', () => {
+    expect(isQuotaLimitError('SESSION LIMIT reached')).toBe(true);
+    expect(isQuotaLimitError('CREDIT BALANCE low')).toBe(true);
+  });
+
+  it('returns false for non-quota errors', () => {
+    expect(isQuotaLimitError('timeout')).toBe(false);
+    expect(isQuotaLimitError('401 unauthorized')).toBe(false);
+    expect(isQuotaLimitError('something completely unexpected happened')).toBe(false);
+  });
+
+  it('drift guard: every QUOTA_LIMIT_PATTERNS entry also classifies FATAL', () => {
+    // Proves QUOTA_LIMIT_PATTERNS can never diverge from FATAL_PATTERNS (#2181) —
+    // a quota-eligible failure must always be one classifyError already treats as
+    // FATAL (never same-provider-retried); fallback is a SEPARATE cross-provider
+    // branch, not a re-opening of that precedence.
+    for (const pattern of QUOTA_LIMIT_PATTERNS) {
+      expect(classifyError(new Error(pattern))).toBe('FATAL');
+    }
   });
 });
 
