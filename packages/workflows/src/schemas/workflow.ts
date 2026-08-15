@@ -9,7 +9,9 @@ import {
   thinkingConfigSchema,
   sandboxSettingsSchema,
   betasSchema,
+  KNOWN_DAG_NODE_KEYS,
 } from './dag-node';
+import type { NestedKeySpec } from './dag-node';
 
 // ---------------------------------------------------------------------------
 // Shared enum schemas
@@ -113,6 +115,29 @@ export const workflowEvidencePolicySchema = z.object({
 export type WorkflowEvidencePolicy = z.infer<typeof workflowEvidencePolicySchema>;
 
 // ---------------------------------------------------------------------------
+// Workflow signature — declared inputs (#2470, Signature Phase 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Declaration of a single input a workflow accepts. All fields optional:
+ *  - `required` — a caller MUST supply this via `with:`; a bare top-level run
+ *    of a workflow with an unsatisfied required input fails before any cost.
+ *  - `default`  — value used when a caller omits the input (mutually exclusive
+ *    with `required: true`; the loader drops any key that declares both).
+ *  - `description` — human documentation only, unused by the engine.
+ *
+ * This is declarative metadata the engine needs to wire and validate `with:`
+ * against — it coordinates, it does not compute (Workflow Language Constitution).
+ */
+export const workflowInputSpecSchema = z.object({
+  required: z.boolean().optional(),
+  default: z.string().optional(),
+  description: z.string().optional(),
+});
+
+export type WorkflowInputSpec = z.infer<typeof workflowInputSpecSchema>;
+
+// ---------------------------------------------------------------------------
 // WorkflowBase — common fields shared by all workflow types
 // ---------------------------------------------------------------------------
 
@@ -153,6 +178,23 @@ export const workflowBaseSchema = z.object({
    * when per-user GitHub is enabled; a no-op for solo PAT installs.
    */
   requires: z.array(workflowRequirementSchema).optional(),
+  /**
+   * Declared inputs this workflow accepts (#2470). A caller supplies values via
+   * `with:` on the `include:`/`workflow:` node that references this workflow;
+   * for sub-runs the values become `$INPUTS.<name>` runtime variables on the
+   * child. When a workflow declares `inputs:`, callers are validated against it
+   * (missing required / undeclared key = load error); a workflow with no
+   * `inputs:` keeps Phase-1 behaviour untouched.
+   */
+  inputs: z.record(z.string(), workflowInputSpecSchema).optional(),
+  /**
+   * The node id whose output IS this workflow's result (#2470). Drives
+   * `$blk.output` for include blocks (the block's `primarySink`, overriding the
+   * positional first-sink default) and the terminal output of a `workflow:`
+   * sub-run child. Selecting by id (not text) works for every node type,
+   * including a non-sink node.
+   */
+  returns: z.string().min(1).optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
@@ -171,6 +213,68 @@ export const workflowDefinitionSchema = workflowBaseSchema.extend({
 
 /** Workflow definition with fully typed nodes (DagNode[]) derived from the schema. */
 export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { prompt?: never };
+
+// ---------------------------------------------------------------------------
+// Known workflow keys — used by the loader to detect unknown/misplaced keys
+// ---------------------------------------------------------------------------
+
+/**
+ * All keys accepted at the workflow level.
+ * Derived from workflowDefinitionSchema shape — no hand-maintained list needed.
+ * Used by parseWorkflow to warn on unknown keys (#2213).
+ */
+export const KNOWN_WORKFLOW_KEYS: ReadonlySet<string> = new Set(
+  Object.keys(workflowDefinitionSchema.shape)
+);
+
+/**
+ * Workflow-only keys that are not valid on individual nodes. Used to produce a
+ * precise hint when a workflow-level key is misplaced on a node (#2213).
+ * Computed as the difference between workflow keys and node keys.
+ */
+export const WORKFLOW_ONLY_KEYS: ReadonlySet<string> = new Set(
+  [...KNOWN_WORKFLOW_KEYS].filter(k => !KNOWN_DAG_NODE_KEYS.has(k))
+);
+
+/**
+ * Known keys for the nested config objects a workflow can carry, keyed by the
+ * workflow-level field that holds them. Same purpose and same derivation as
+ * KNOWN_NODE_NESTED_KEYS — an unknown key one level down is stripped just as
+ * silently as one at the top (#2213).
+ *
+ * `sandbox` (`.passthrough()`) and `thinking` (`z.preprocess`) are omitted for
+ * the same reasons they are omitted at node level. `nodes` is handled by the
+ * per-node check, not here.
+ *
+ * Constructed with `keyof typeof workflowDefinitionSchema.shape` as the key type
+ * so a typo'd registration fails to compile rather than silently disabling the
+ * check; the exported type widens back to `string` for lookup (same split as
+ * KNOWN_NODE_NESTED_KEYS).
+ */
+export const KNOWN_WORKFLOW_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = new Map<
+  keyof typeof workflowDefinitionSchema.shape,
+  NestedKeySpec
+>([
+  ['worktree', { kind: 'object', keys: new Set(Object.keys(workflowWorktreePolicySchema.shape)) }],
+  [
+    'container',
+    { kind: 'object', keys: new Set(Object.keys(workflowContainerPolicySchema.shape)) },
+  ],
+  [
+    'evidence_policy',
+    { kind: 'object', keys: new Set(Object.keys(workflowEvidencePolicySchema.shape)) },
+  ],
+  // First `record` entry in this map: `inputs` is a record of input-name → spec,
+  // so unknown keys under an individual spec (e.g. `inputs.diff.typo`) warn.
+  // `returns` is a plain string and needs no nested registration.
+  [
+    'inputs',
+    {
+      kind: 'record',
+      entry: { kind: 'object', keys: new Set(Object.keys(workflowInputSpecSchema.shape)) },
+    },
+  ],
+]);
 
 // ---------------------------------------------------------------------------
 // LoadCommandResult — discriminated union for command load outcomes
@@ -219,6 +323,8 @@ export type WorkflowSource = 'bundled' | 'global' | 'project';
 export interface WorkflowWithSource {
   readonly workflow: WorkflowDefinition;
   readonly source: WorkflowSource;
+  /** Warnings from YAML parsing (e.g. unknown keys) — never hard-fails. */
+  readonly parseWarnings?: readonly string[];
 }
 
 /**

@@ -14,6 +14,14 @@ import type {
 
 export type { WorkflowNodeSession } from './schemas';
 
+export interface DagResumeSnapshot {
+  completedNodeOutputs: Map<string, string>;
+  tokens: {
+    input: number;
+    output: number;
+  };
+}
+
 /** Composite primary key identifying a single persisted node session row. */
 export interface WorkflowNodeSessionKey {
   workflow_name: string;
@@ -26,6 +34,12 @@ export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
   'workflow_completed',
   'workflow_failed',
+  // #2348 — written by the resume CAS ONLY when it clears a non-empty
+  // `metadata.error`, carrying that error in `data.error`. It is the audit
+  // record for a failure that resume would otherwise erase (the CLI's SIGTERM
+  // handler records a failure in metadata and nowhere else), NOT a general
+  // "a resume happened" marker: its absence never means the run wasn't resumed.
+  'workflow_resumed',
   'node_started',
   'node_completed',
   'node_failed',
@@ -66,6 +80,12 @@ export const WORKFLOW_EVENT_TYPES = [
   // `$ARTIFACTS_DIR/evidence.json` was absent at completion time — the run was
   // refused terminal `completed` and marked failed. Data carries the expected path.
   'evidence_validation_failed',
+  // #2213 — keys the engine dropped from this run's workflow YAML. Written by the
+  // executor at run start for EVERY run that has them, whatever surface started
+  // it, so the record does not depend on a chat/console notification being
+  // deliverable. `data.warnings` is the message list. Absence means the YAML was
+  // clean OR the run predates this event type — never that delivery failed.
+  'workflow_parse_warnings',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
@@ -139,9 +159,15 @@ export interface IWorkflowStore extends IRunTreeStore {
   findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
   failOrphanedRuns(): Promise<{ count: number }>;
   resumeWorkflowRun(id: string): Promise<WorkflowRun>;
+  /**
+   * `output_root` (#2200) is write-once: the executor sets it at run start only
+   * when the persisted value is null. Re-writing it on resume would re-derive
+   * the path from a possibly-renamed codebase and orphan the run's artifacts,
+   * defeating the whole point of persisting it.
+   */
   updateWorkflowRun(
     id: string,
-    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata'>>
+    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>>
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
@@ -187,14 +213,13 @@ export interface IWorkflowStore extends IRunTreeStore {
   }): Promise<void>;
 
   /**
-   * Return a map of nodeId → output for all node_completed events
-   * from a prior DAG workflow run. Used for DAG resume: the executor
-   * pre-populates nodeOutputs so completed nodes are skipped on re-run.
+   * Return completed node outputs and cumulative token usage from a prior DAG
+   * workflow run. Used for resume hydration so completed nodes are skipped and
+   * the run-level token tally includes every execution of the run.
    *
-   * Returns an empty map when no completed nodes exist.
    * Throws on DB error — caller (executor.ts) owns the degradation policy.
    */
-  getCompletedDagNodeOutputs(workflowRunId: string): Promise<Map<string, string>>;
+  getDagResumeSnapshot(workflowRunId: string): Promise<DagResumeSnapshot>;
 
   // Per-codebase env vars for workflow node injection
   getCodebaseEnvVars(codebaseId: string): Promise<Record<string, string>>;

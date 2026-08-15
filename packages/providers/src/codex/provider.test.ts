@@ -77,7 +77,7 @@ describe('CodexProvider', () => {
         sessionResume: true,
         mcp: true,
         hooks: false,
-        skills: true,
+        skills: false,
         agents: false,
         toolRestrictions: false,
         structuredOutput: 'enforced',
@@ -95,6 +95,168 @@ describe('CodexProvider', () => {
   });
 
   describe('sendQuery', () => {
+    test.each([
+      ['omitted', undefined],
+      ['empty', []],
+      ['non-empty', ['prp-issue']],
+    ])(
+      'disables automatic skill instructions for workflow nodes when skills are %s',
+      async (_label, skills) => {
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          nodeConfig: { nodeId: 'investigate', ...(skills === undefined ? {} : { skills }) },
+        })) {
+          // consume
+        }
+
+        expect(MockCodex).toHaveBeenCalledWith(
+          expect.objectContaining({
+            config: { skills: { include_instructions: false } },
+          })
+        );
+      }
+    );
+
+    test('leaves direct non-workflow Codex calls on the native skill setting', async () => {
+      for await (const _ of client.sendQuery('test prompt', '/workspace')) {
+        // consume
+      }
+
+      expect(MockCodex).toHaveBeenCalledTimes(1);
+      expect(MockCodex.mock.calls[0]?.[0]).not.toHaveProperty('config');
+    });
+
+    test('uses the workflow skill-catalog override when resuming a thread', async () => {
+      for await (const _ of client.sendQuery('test prompt', '/workspace', 'existing-thread', {
+        nodeConfig: { nodeId: 'investigate' },
+      })) {
+        // consume
+      }
+
+      expect(MockCodex).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: { skills: { include_instructions: false } },
+        })
+      );
+      expect(mockResumeThread).toHaveBeenCalledWith(
+        'existing-thread',
+        expect.objectContaining({ workingDirectory: '/workspace' })
+      );
+    });
+
+    test('warns and retries a resumed MCP thread without catalog suppression when the binary rejects the key', async () => {
+      const testDir = await mkdtemp(join(tmpdir(), 'codex-provider-skill-fallback-'));
+      await writeFile(
+        join(testDir, 'mcp.json'),
+        JSON.stringify({ figma: { type: 'http', url: 'http://127.0.0.1:3845/mcp' } })
+      );
+      let calls = 0;
+      mockRunStreamed.mockImplementation(() => {
+        calls++;
+        const call = calls;
+        return Promise.resolve({
+          events: (async function* () {
+            if (call === 1) {
+              throw new Error(
+                'Error loading config: unknown field `include_instructions` in `skills`'
+              );
+            }
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+      });
+
+      const chunks = [];
+      try {
+        for await (const chunk of client.sendQuery('test prompt', testDir, 'existing-thread', {
+          nodeConfig: { nodeId: 'investigate', mcp: 'mcp.json' },
+        })) {
+          chunks.push(chunk);
+        }
+      } finally {
+        await rm(testDir, { recursive: true, force: true });
+      }
+
+      expect(MockCodex).toHaveBeenCalledTimes(2);
+      expect(MockCodex.mock.calls[0]?.[0]).toMatchObject({
+        config: {
+          skills: { include_instructions: false },
+          mcp_servers: { figma: expect.objectContaining({ url: 'http://127.0.0.1:3845/mcp' }) },
+        },
+      });
+      const initialConfig = MockCodex.mock.calls[0]?.[0]?.config;
+      const fallbackConfig = MockCodex.mock.calls[1]?.[0]?.config;
+      expect(initialConfig).toBeDefined();
+      const { skills: _skills, ...initialConfigWithoutSkills } = initialConfig ?? {};
+      expect(fallbackConfig).toEqual(initialConfigWithoutSkills);
+      expect(mockResumeThread).toHaveBeenCalledTimes(2);
+      expect(mockResumeThread).toHaveBeenNthCalledWith(
+        2,
+        'existing-thread',
+        expect.objectContaining({ workingDirectory: testDir })
+      );
+      expect(chunks[0]).toEqual({
+        type: 'system',
+        content: expect.stringContaining('Continuing with native skill discovery enabled'),
+      });
+      expect(chunks.at(-1)).toMatchObject({
+        type: 'result',
+        sessionId: 'resumed-thread-id',
+        resumed: true,
+      });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ nodeId: 'investigate' }),
+        'codex.workflow_skill_catalog_suppression_unsupported'
+      );
+    });
+
+    test('does not replay a turn when a catalog config error arrives after provider output', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield {
+            type: 'item.completed',
+            item: { id: 'message-1', type: 'agent_message', text: 'already emitted' },
+          };
+          throw new Error('Error loading config: unknown field `include_instructions` in `skills`');
+        })(),
+      });
+
+      const chunks = [];
+      await expect(
+        (async (): Promise<void> => {
+          for await (const chunk of client.sendQuery('test prompt', '/workspace', undefined, {
+            nodeConfig: { nodeId: 'investigate' },
+          })) {
+            chunks.push(chunk);
+          }
+        })()
+      ).rejects.toThrow('include_instructions');
+
+      expect(chunks).toContainEqual({ type: 'assistant', content: 'already emitted' });
+      expect(MockCodex).toHaveBeenCalledTimes(1);
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'codex.workflow_skill_catalog_suppression_unsupported'
+      );
+    });
+
+    test('does not treat unrelated Codex failures as catalog compatibility errors', async () => {
+      mockRunStreamed.mockRejectedValue(new Error('authentication failed'));
+
+      expect(
+        (async (): Promise<void> => {
+          for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+            nodeConfig: { nodeId: 'investigate' },
+          })) {
+            // consume
+          }
+        })()
+      ).rejects.toThrow('Codex auth error');
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'codex.workflow_skill_catalog_suppression_unsupported'
+      );
+    });
+
     test('yields text events from agent_message items', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
@@ -218,8 +380,13 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
+            type: 'item.started',
+            item: { id: 'cmd-1', type: 'command_execution', command: 'npm test' },
+          };
+          yield {
             type: 'item.completed',
             item: {
+              id: 'cmd-1',
               type: 'command_execution',
               command: 'npm test',
               aggregated_output: 'tests passed\n',
@@ -235,11 +402,14 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: 'npm test' });
+      expect(chunks[0]).toEqual({ type: 'tool', toolName: 'npm test', toolCallId: 'cmd-1' });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: 'npm test',
         toolOutput: 'tests passed\n',
+        toolCallId: 'cmd-1',
+        toolOutcome: 'success',
+        exitCode: 0,
       });
     });
 
@@ -247,8 +417,13 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
+            type: 'item.started',
+            item: { id: 'cmd-2', type: 'command_execution', command: 'npm test' },
+          };
+          yield {
             type: 'item.completed',
             item: {
+              id: 'cmd-2',
               type: 'command_execution',
               command: 'npm test',
               aggregated_output: 'failure\n',
@@ -268,6 +443,40 @@ describe('CodexProvider', () => {
         type: 'tool_result',
         toolName: 'npm test',
         toolOutput: 'failure\n\n[exit code: 1]',
+        toolCallId: 'cmd-2',
+        toolOutcome: 'error',
+        exitCode: 1,
+      });
+    });
+
+    test('marks command execution with a missing exit code as unknown', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield {
+            type: 'item.completed',
+            item: {
+              id: 'cmd-unknown',
+              type: 'command_execution',
+              command: 'npm test',
+              aggregated_output: 'partial output',
+              exit_code: null,
+            },
+          };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test prompt', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[0]).toEqual({
+        type: 'tool_result',
+        toolName: 'npm test',
+        toolOutput: 'partial output',
+        toolCallId: 'cmd-unknown',
+        toolOutcome: 'unknown',
       });
     });
 
@@ -293,7 +502,14 @@ describe('CodexProvider', () => {
     test('yields tool events from web_search items', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
-          yield { type: 'item.completed', item: { type: 'web_search', query: 'codex sdk' } };
+          yield {
+            type: 'item.started',
+            item: { id: 'search-1', type: 'web_search', query: 'codex sdk' },
+          };
+          yield {
+            type: 'item.completed',
+            item: { id: 'search-1', type: 'web_search', query: 'codex sdk' },
+          };
           yield { type: 'turn.completed', usage: defaultUsage };
         })(),
       });
@@ -303,11 +519,17 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50D} Searching: codex sdk' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50D} Searching: codex sdk',
+        toolCallId: 'search-1',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50D} Searching: codex sdk',
         toolOutput: '',
+        toolCallId: 'search-1',
+        toolOutcome: 'unknown',
       });
     });
 
@@ -493,12 +715,39 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
-            type: 'item.completed',
-            item: { type: 'mcp_tool_call', server: 'fs', tool: 'readFile', status: 'in_progress' },
+            type: 'item.started',
+            item: {
+              id: 'mcp-1',
+              type: 'mcp_tool_call',
+              server: 'fs',
+              tool: 'readFile',
+              status: 'in_progress',
+            },
           };
           yield {
             type: 'item.completed',
             item: {
+              id: 'mcp-1',
+              type: 'mcp_tool_call',
+              server: 'fs',
+              tool: 'readFile',
+              status: 'completed',
+            },
+          };
+          yield {
+            type: 'item.started',
+            item: {
+              id: 'mcp-2',
+              type: 'mcp_tool_call',
+              server: 'fs',
+              tool: 'readFile',
+              status: 'in_progress',
+            },
+          };
+          yield {
+            type: 'item.completed',
+            item: {
+              id: 'mcp-2',
               type: 'mcp_tool_call',
               server: 'fs',
               tool: 'readFile',
@@ -515,19 +764,29 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      // First mcp call (in_progress on item.completed): start + empty result
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: fs/readFile',
+        toolCallId: 'mcp-1',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: fs/readFile',
         toolOutput: '',
+        toolCallId: 'mcp-1',
+        toolOutcome: 'success',
       });
-      // Second mcp call (failed): start + error result so the UI card closes
-      expect(chunks[2]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[2]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: fs/readFile',
+        toolCallId: 'mcp-2',
+      });
       expect(chunks[3]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: fs/readFile',
         toolOutput: '\u274C Error: Permission denied',
+        toolCallId: 'mcp-2',
+        toolOutcome: 'error',
       });
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({ server: 'fs', tool: 'readFile' }),
@@ -539,16 +798,28 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
-            type: 'item.completed',
-            item: { type: 'mcp_tool_call', tool: 'readFile', status: 'in_progress' },
+            type: 'item.started',
+            item: { id: 'mcp-tool', type: 'mcp_tool_call', tool: 'readFile' },
           };
           yield {
             type: 'item.completed',
-            item: { type: 'mcp_tool_call', server: 'fs', status: 'in_progress' },
+            item: { id: 'mcp-tool', type: 'mcp_tool_call', tool: 'readFile', status: 'completed' },
+          };
+          yield {
+            type: 'item.started',
+            item: { id: 'mcp-server', type: 'mcp_tool_call', server: 'fs' },
           };
           yield {
             type: 'item.completed',
-            item: { type: 'mcp_tool_call', status: 'in_progress' },
+            item: { id: 'mcp-server', type: 'mcp_tool_call', server: 'fs', status: 'completed' },
+          };
+          yield {
+            type: 'item.started',
+            item: { id: 'mcp-unknown', type: 'mcp_tool_call' },
+          };
+          yield {
+            type: 'item.completed',
+            item: { id: 'mcp-unknown', type: 'mcp_tool_call', status: 'completed' },
           };
           yield { type: 'turn.completed', usage: defaultUsage };
         })(),
@@ -559,23 +830,41 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: readFile' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: readFile',
+        toolCallId: 'mcp-tool',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: readFile',
         toolOutput: '',
+        toolCallId: 'mcp-tool',
+        toolOutcome: 'success',
       });
-      expect(chunks[2]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs' });
+      expect(chunks[2]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: fs',
+        toolCallId: 'mcp-server',
+      });
       expect(chunks[3]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: fs',
         toolOutput: '',
+        toolCallId: 'mcp-server',
+        toolOutcome: 'success',
       });
-      expect(chunks[4]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: MCP tool' });
+      expect(chunks[4]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: MCP tool',
+        toolCallId: 'mcp-unknown',
+      });
       expect(chunks[5]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: MCP tool',
         toolOutput: '',
+        toolCallId: 'mcp-unknown',
+        toolOutcome: 'success',
       });
     });
 
@@ -583,8 +872,18 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
+            type: 'item.started',
+            item: { id: 'mcp-failure', type: 'mcp_tool_call', server: 'db', tool: 'query' },
+          };
+          yield {
             type: 'item.completed',
-            item: { type: 'mcp_tool_call', server: 'db', tool: 'query', status: 'failed' },
+            item: {
+              id: 'mcp-failure',
+              type: 'mcp_tool_call',
+              server: 'db',
+              tool: 'query',
+              status: 'failed',
+            },
           };
           yield { type: 'turn.completed', usage: defaultUsage };
         })(),
@@ -595,11 +894,17 @@ describe('CodexProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: db/query' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: db/query',
+        toolCallId: 'mcp-failure',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: db/query',
         toolOutput: '\u274C Error: MCP tool failed',
+        toolCallId: 'mcp-failure',
+        toolOutcome: 'error',
       });
     });
 
@@ -607,8 +912,13 @@ describe('CodexProvider', () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield {
+            type: 'item.started',
+            item: { id: 'mcp-completed', type: 'mcp_tool_call', server: 'fs', tool: 'readFile' },
+          };
+          yield {
             type: 'item.completed',
             item: {
+              id: 'mcp-completed',
               type: 'mcp_tool_call',
               server: 'fs',
               tool: 'readFile',
@@ -626,11 +936,17 @@ describe('CodexProvider', () => {
       }
 
       expect(chunks).toHaveLength(3);
-      expect(chunks[0]).toEqual({ type: 'tool', toolName: '\u{1F50C} MCP: fs/readFile' });
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: '\u{1F50C} MCP: fs/readFile',
+        toolCallId: 'mcp-completed',
+      });
       expect(chunks[1]).toEqual({
         type: 'tool_result',
         toolName: '\u{1F50C} MCP: fs/readFile',
         toolOutput: JSON.stringify([{ type: 'text', text: 'file contents' }]),
+        toolCallId: 'mcp-completed',
+        toolOutcome: 'success',
       });
       expect(chunks[2]).toEqual({
         type: 'result',
@@ -1034,7 +1350,7 @@ describe('CodexProvider', () => {
         });
 
         for await (const _ of client.sendQuery('test prompt', testDir, undefined, {
-          nodeConfig: { mcp: 'mcp.json' },
+          nodeConfig: { nodeId: 'notify', mcp: 'mcp.json' },
         })) {
           // consume
         }
@@ -1042,6 +1358,7 @@ describe('CodexProvider', () => {
         expect(MockCodex).toHaveBeenCalledWith(
           expect.objectContaining({
             config: expect.objectContaining({
+              skills: { include_instructions: false },
               mcp_servers: expect.objectContaining({
                 figma: expect.objectContaining({
                   url: 'http://127.0.0.1:3845/mcp',
@@ -1209,7 +1526,10 @@ describe('CodexProvider', () => {
     test('logs progress for item.started and item.completed events', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
-          yield { type: 'item.started', item: { id: 'item-1', type: 'command_execution' } };
+          yield {
+            type: 'item.started',
+            item: { id: 'item-1', type: 'command_execution', command: 'npm test' },
+          };
           yield {
             type: 'item.completed',
             item: { id: 'item-1', type: 'command_execution', command: 'npm test' },
@@ -1236,6 +1556,93 @@ describe('CodexProvider', () => {
           command: 'npm test',
         },
         'item_completed'
+      );
+      expect(chunks[0]).toEqual({
+        type: 'tool',
+        toolName: 'npm test',
+        toolCallId: 'item-1',
+      });
+      expect(chunks[1]).toEqual({
+        type: 'tool_result',
+        toolName: 'npm test',
+        toolOutput: '',
+        toolCallId: 'item-1',
+        toolOutcome: 'unknown',
+      });
+    });
+
+    test('deduplicates repeated tool lifecycle events by item id', async () => {
+      const started = {
+        type: 'item.started',
+        item: { id: 'cmd-duplicate', type: 'command_execution', command: 'npm test' },
+      };
+      const completed = {
+        type: 'item.completed',
+        item: {
+          id: 'cmd-duplicate',
+          type: 'command_execution',
+          command: 'npm test',
+          aggregated_output: 'done',
+          exit_code: 0,
+        },
+      };
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield started;
+          yield started;
+          yield completed;
+          yield completed;
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.filter(chunk => chunk.type === 'tool')).toHaveLength(1);
+      expect(chunks.filter(chunk => chunk.type === 'tool_result')).toHaveLength(1);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { itemId: 'cmd-duplicate', itemType: 'command_execution' },
+        'tool_item_duplicate_completion'
+      );
+    });
+
+    test('does not recreate a tool start when completion arrives alone', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield {
+            type: 'item.completed',
+            item: {
+              id: 'cmd-completed-only',
+              type: 'command_execution',
+              command: 'npm test',
+              aggregated_output: 'done',
+              exit_code: 0,
+            },
+          };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.some(chunk => chunk.type === 'tool')).toBe(false);
+      expect(chunks[0]).toEqual({
+        type: 'tool_result',
+        toolName: 'npm test',
+        toolOutput: 'done',
+        toolCallId: 'cmd-completed-only',
+        toolOutcome: 'success',
+        exitCode: 0,
+      });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { itemId: 'cmd-completed-only', itemType: 'command_execution' },
+        'tool_item_completed_without_start'
       );
     });
 

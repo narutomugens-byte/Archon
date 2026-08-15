@@ -210,6 +210,32 @@ function buildCodexMcpConfigOverrides(
   return { mcp_servers: mcpServers };
 }
 
+function isWorkflowNode(requestOptions?: SendQueryOptions): boolean {
+  const nodeId = requestOptions?.nodeConfig?.nodeId;
+  return typeof nodeId === 'string' && nodeId.trim().length > 0;
+}
+
+function withWorkflowSkillCatalogDisabled(config?: CodexConfigOverrides): CodexConfigOverrides {
+  return {
+    ...(config ?? {}),
+    skills: { include_instructions: false },
+  };
+}
+
+function isWorkflowSkillCatalogConfigUnsupported(errorMessage: string): boolean {
+  const normalized = errorMessage.toLowerCase();
+  const namesCatalogSetting =
+    normalized.includes('skills.include_instructions') ||
+    normalized.includes('include_instructions');
+  const isConfigRejection =
+    normalized.includes('config') ||
+    normalized.includes('unknown field') ||
+    normalized.includes('unknown key') ||
+    normalized.includes('unrecognized') ||
+    normalized.includes('failed to parse');
+  return namesCatalogSetting && isConfigRejection;
+}
+
 // Maps slugs that ChatGPT-plan accounts now reject (previously shipped as Archon
 // suggestions/defaults) to a current, plan-accepted slug to suggest instead.
 const CODEX_MODEL_FALLBACKS: Record<string, string> = {
@@ -370,6 +396,15 @@ function buildEffectivePrompt(prompt: string, requestOptions?: SendQueryOptions)
 /** State maintained across Codex event stream normalization. */
 interface CodexStreamState {
   lastTodoListSignature?: string;
+  startedToolItemIds: Set<string>;
+  completedToolItemIds: Set<string>;
+}
+
+function getMcpToolName(item: Record<string, unknown>): string {
+  const server = item.server as string | undefined;
+  const tool = item.tool as string | undefined;
+  const toolInfo = server && tool ? `${server}/${tool}` : (tool ?? server ?? 'MCP tool');
+  return `🔌 MCP: ${toolInfo}`;
 }
 
 /**
@@ -383,7 +418,10 @@ async function* streamCodexEvents(
   abortSignal?: AbortSignal,
   surfaceMcpClientErrors = false
 ): AsyncGenerator<MessageChunk> {
-  const state: CodexStreamState = {};
+  const state: CodexStreamState = {
+    startedToolItemIds: new Set<string>(),
+    completedToolItemIds: new Set<string>(),
+  };
   let accumulatedText = '';
 
   // A new thread's id is assigned during the run via the `thread.started` event
@@ -432,11 +470,33 @@ async function* streamCodexEvents(
     }
 
     if (event.type === 'item.started') {
-      const item = event.item as { type: string; id: string };
-      getLog().debug(
-        { eventType: event.type, itemType: item.type, itemId: item.id },
-        'item_started'
-      );
+      const item = event.item as Record<string, unknown>;
+      const itemType = item.type as string;
+      const itemId = item.id as string;
+      getLog().debug({ eventType: event.type, itemType, itemId }, 'item_started');
+
+      let toolName: string | undefined;
+      if (itemType === 'command_execution') {
+        if (typeof item.command === 'string' && item.command.length > 0) {
+          toolName = item.command;
+        } else {
+          getLog().warn({ itemId }, 'command_execution_missing_command');
+        }
+      } else if (itemType === 'web_search') {
+        if (typeof item.query === 'string' && item.query.length > 0) {
+          toolName = `🔍 Searching: ${item.query}`;
+        } else {
+          getLog().debug({ itemId }, 'web_search_missing_query');
+        }
+      } else if (itemType === 'mcp_tool_call') {
+        toolName = getMcpToolName(item);
+      }
+
+      if (toolName && itemId && !state.startedToolItemIds.has(itemId)) {
+        state.startedToolItemIds.add(itemId);
+        yield { type: 'tool', toolName, toolCallId: itemId };
+      }
+      continue;
     }
 
     if (event.type === 'error') {
@@ -487,6 +547,22 @@ async function* streamCodexEvents(
       }
       getLog().debug(logContext, 'item_completed');
 
+      const itemId = item.id as string;
+      const isToolItem =
+        itemType === 'command_execution' ||
+        itemType === 'web_search' ||
+        itemType === 'mcp_tool_call';
+      if (isToolItem) {
+        if (state.completedToolItemIds.has(itemId)) {
+          getLog().warn({ itemId, itemType }, 'tool_item_duplicate_completion');
+          continue;
+        }
+        state.completedToolItemIds.add(itemId);
+        if (!state.startedToolItemIds.has(itemId)) {
+          getLog().warn({ itemId, itemType }, 'tool_item_completed_without_start');
+        }
+      }
+
       switch (itemType) {
         case 'agent_message':
           if (item.text) {
@@ -500,14 +576,24 @@ async function* streamCodexEvents(
         case 'command_execution':
           if (item.command) {
             const cmd = item.command as string;
-            yield { type: 'tool', toolName: cmd };
             const exitCode = item.exit_code as number | null | undefined;
             const exitSuffix =
               exitCode != null && exitCode !== 0 ? `\n[exit code: ${String(exitCode)}]` : '';
+            let toolOutcome: 'success' | 'error' | 'unknown';
+            if (exitCode === 0) {
+              toolOutcome = 'success';
+            } else if (exitCode == null) {
+              toolOutcome = 'unknown';
+            } else {
+              toolOutcome = 'error';
+            }
             yield {
               type: 'tool_result',
               toolName: cmd,
               toolOutput: ((item.aggregated_output as string) ?? '') + exitSuffix,
+              toolCallId: itemId,
+              toolOutcome,
+              ...(exitCode != null ? { exitCode } : {}),
             };
           } else {
             getLog().warn({ itemId: item.id }, 'command_execution_missing_command');
@@ -523,8 +609,13 @@ async function* streamCodexEvents(
         case 'web_search':
           if (item.query) {
             const searchToolName = `🔍 Searching: ${item.query as string}`;
-            yield { type: 'tool', toolName: searchToolName };
-            yield { type: 'tool_result', toolName: searchToolName, toolOutput: '' };
+            yield {
+              type: 'tool_result',
+              toolName: searchToolName,
+              toolOutput: '',
+              toolCallId: itemId,
+              toolOutcome: 'unknown',
+            };
           } else {
             getLog().debug({ itemId: item.id }, 'web_search_missing_query');
           }
@@ -595,10 +686,7 @@ async function* streamCodexEvents(
         case 'mcp_tool_call': {
           const server = item.server as string | undefined;
           const tool = item.tool as string | undefined;
-          const toolInfo = server && tool ? `${server}/${tool}` : (tool ?? server ?? 'MCP tool');
-          const mcpToolName = `🔌 MCP: ${toolInfo}`;
-
-          yield { type: 'tool', toolName: mcpToolName };
+          const mcpToolName = getMcpToolName(item);
 
           if ((item.status as string) === 'failed') {
             getLog().warn(
@@ -609,7 +697,13 @@ async function* streamCodexEvents(
             const errMsg = mcpError?.message
               ? `❌ Error: ${mcpError.message}`
               : '❌ Error: MCP tool failed';
-            yield { type: 'tool_result', toolName: mcpToolName, toolOutput: errMsg };
+            yield {
+              type: 'tool_result',
+              toolName: mcpToolName,
+              toolOutput: errMsg,
+              toolCallId: itemId,
+              toolOutcome: 'error',
+            };
           } else {
             let toolOutput = '';
             const mcpResult = item.result as { content?: unknown } | undefined;
@@ -628,7 +722,13 @@ async function* streamCodexEvents(
                 );
               }
             }
-            yield { type: 'tool_result', toolName: mcpToolName, toolOutput };
+            yield {
+              type: 'tool_result',
+              toolName: mcpToolName,
+              toolOutput,
+              toolCallId: itemId,
+              toolOutcome: 'success',
+            };
           }
           break;
         }
@@ -781,7 +881,7 @@ export class CodexProvider implements IAgentProvider {
     const assistantConfig = requestOptions?.assistantConfig ?? {};
     const codexConfig = parseCodexConfig(assistantConfig);
     const providerWarnings: ProviderWarning[] = [];
-    let codexConfigOverrides: CodexConfigOverrides | undefined;
+    let declaredMcpConfigOverrides: CodexConfigOverrides | undefined;
 
     if (requestOptions?.nodeConfig?.mcp) {
       const mcpPath = requestOptions.nodeConfig.mcp;
@@ -790,7 +890,7 @@ export class CodexProvider implements IAgentProvider {
         cwd,
         buildMcpEnvSource(requestOptions.env)
       );
-      codexConfigOverrides = buildCodexMcpConfigOverrides(servers);
+      declaredMcpConfigOverrides = buildCodexMcpConfigOverrides(servers);
       getLog().info({ serverNames, mcpPath }, 'codex.mcp_config_loaded');
       if (missingVars.length > 0) {
         const uniqueVars = [...new Set(missingVars)];
@@ -802,15 +902,20 @@ export class CodexProvider implements IAgentProvider {
       }
     }
 
+    const suppressWorkflowSkillCatalog = isWorkflowNode(requestOptions);
+    const initialConfigOverrides = suppressWorkflowSkillCatalog
+      ? withWorkflowSkillCatalogDisabled(declaredMcpConfigOverrides)
+      : declaredMcpConfigOverrides;
+
     for (const warning of providerWarnings) {
       yield { type: 'system', content: `⚠️ ${warning.message}` };
     }
 
     // 1. Initialize SDK and build thread options
-    const codex = await this.createCodexClient(
+    let codex = await this.createCodexClient(
       codexConfig.codexBinaryPath,
       requestOptions?.env,
-      codexConfigOverrides
+      initialConfigOverrides
     );
     const threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
 
@@ -864,6 +969,7 @@ export class CodexProvider implements IAgentProvider {
     const { turnOptions, hasOutputFormat } = buildTurnOptions(requestOptions);
     const effectivePrompt = buildEffectivePrompt(prompt, requestOptions);
     let lastError: Error | undefined;
+    let skillCatalogCompatibilityFallbackUsed = false;
 
     for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
       if (requestOptions?.abortSignal?.aborted) {
@@ -904,24 +1010,77 @@ export class CodexProvider implements IAgentProvider {
         }
 
         try {
-          // 4. Run streamed turn
-          const result = await thread.runStreamed(effectivePrompt, turnOptions);
+          // 4. Run and consume the streamed turn. Codex starts its subprocess
+          // lazily while events are iterated, so compatibility errors must be
+          // caught around both runStreamed() and event consumption.
+          let providerEventEmitted = false;
+          while (true) {
+            try {
+              const result = await thread.runStreamed(effectivePrompt, turnOptions);
+              for await (const chunk of withResumedOutcome(
+                streamCodexEvents(
+                  result.events as AsyncIterable<Record<string, unknown>>,
+                  hasOutputFormat,
+                  thread.id,
+                  attemptController.signal,
+                  Boolean(requestOptions?.nodeConfig?.mcp)
+                ),
+                // Stamp from the attempt that produced the result: any retry
+                // (attempt > 0) re-runs on a fresh startThread (cold), so the prior
+                // session context is lost even when the initial resumeThread succeeded.
+                resumedOutcome(resumeSessionId, !sessionResumeFailed && attempt === 0)
+              )) {
+                providerEventEmitted = true;
+                yield chunk;
+              }
+              return;
+            } catch (error) {
+              const err = error as Error;
+              if (
+                providerEventEmitted ||
+                !suppressWorkflowSkillCatalog ||
+                skillCatalogCompatibilityFallbackUsed ||
+                !isWorkflowSkillCatalogConfigUnsupported(err.message)
+              ) {
+                throw error;
+              }
 
-          // 5. Stream normalized events (fresh state per attempt to avoid dedup leaks)
-          yield* withResumedOutcome(
-            streamCodexEvents(
-              result.events as AsyncIterable<Record<string, unknown>>,
-              hasOutputFormat,
-              thread.id,
-              attemptController.signal,
-              Boolean(requestOptions?.nodeConfig?.mcp)
-            ),
-            // Stamp from the attempt that produced the result: any retry
-            // (attempt > 0) re-runs on a fresh startThread (cold), so the prior
-            // session context is lost even when the initial resumeThread succeeded.
-            resumedOutcome(resumeSessionId, !sessionResumeFailed && attempt === 0)
-          );
-          return;
+              skillCatalogCompatibilityFallbackUsed = true;
+              getLog().warn(
+                { err, nodeId: requestOptions?.nodeConfig?.nodeId },
+                'codex.workflow_skill_catalog_suppression_unsupported'
+              );
+              yield {
+                type: 'system',
+                content:
+                  '⚠️ This Codex binary does not support suppressing the automatic skill catalog. Continuing with native skill discovery enabled.',
+              };
+
+              codex = await this.createCodexClient(
+                codexConfig.codexBinaryPath,
+                requestOptions?.env,
+                declaredMcpConfigOverrides
+              );
+              if (resumeSessionId) {
+                try {
+                  thread = codex.resumeThread(resumeSessionId, threadOptions);
+                } catch (resumeError) {
+                  getLog().error(
+                    { err: resumeError, sessionId: resumeSessionId },
+                    'resume_thread_failed'
+                  );
+                  thread = codex.startThread(threadOptions);
+                  sessionResumeFailed = true;
+                  yield {
+                    type: 'system',
+                    content: '⚠️ Could not resume previous session. Starting fresh conversation.',
+                  };
+                }
+              } else {
+                thread = codex.startThread(threadOptions);
+              }
+            }
+          }
         } catch (error) {
           const err = error as Error;
 

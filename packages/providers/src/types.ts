@@ -171,6 +171,11 @@ export interface TokenUsage {
   cost?: number;
 }
 
+/** Concrete model identifier reported by a provider after a request completes. */
+export interface ResolvedModel {
+  id: string;
+}
+
 /**
  * Message chunk from AI assistant.
  * Discriminated union with per-type required fields for type safety.
@@ -199,7 +204,8 @@ export type MessageChunk =
       cost?: number;
       stopReason?: string;
       numTurns?: number;
-      modelUsage?: Record<string, unknown>;
+      /** Concrete model reported by the provider; omitted when its SDK does not expose one. */
+      resolvedModel?: ResolvedModel;
       /**
        * Outcome of a session-resume attempt, so a failed resume is observable
        * instead of silently continuing with a fresh (cold) session:
@@ -228,6 +234,19 @@ export type MessageChunk =
       toolOutput: string;
       /** Matching ID for the originating `tool` chunk. See `tool` variant above. */
       toolCallId?: string;
+      /**
+       * Known statuses are provider-reported. `unknown` covers two distinct
+       * cases that share one property — no authoritative status exists:
+       *   1. the provider completed the tool but reports no status (e.g. Codex
+       *      web_search, provider.ts:591), and
+       *   2. a synthetic closure emitted with no provider result at all.
+       * Never inferred from formatted output: a tool whose text merely looks
+       * like an error is still `unknown`, because guessing here would put a
+       * fabricated status next to reported ones and make neither trustworthy.
+       */
+      toolOutcome?: 'success' | 'error' | 'interrupted' | 'unknown';
+      /** Provider-reported process exit code, when the tool exposes one. */
+      exitCode?: number;
     }
   // ─── Subagent Task Lifecycle (Claude SDK `system` subtypes) ────────────
   // Forwarded by the Claude provider from SDKTaskStartedMessage /

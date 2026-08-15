@@ -5,6 +5,7 @@
  */
 
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import { writeStdout } from '../utils/stdout';
 import {
   validateWorkflowResources,
   validateCommand,
@@ -21,6 +22,7 @@ import type {
   ScriptValidationResult,
 } from '@archon/workflows/validator';
 import { loadConfig, loadRepoConfig } from '@archon/core';
+import { parseClaudeSettingSources } from '@archon/providers';
 
 /**
  * Build ValidationConfig from the repo's .archon/config.yaml
@@ -106,7 +108,7 @@ export async function validateWorkflowsCommand(
   }
 
   // Validate successfully parsed workflows (Level 3)
-  for (const { workflow, source } of workflowEntries) {
+  for (const { workflow, source, parseWarnings } of workflowEntries) {
     const issues = await validateWorkflowResources(
       workflow,
       cwd,
@@ -116,9 +118,25 @@ export async function validateWorkflowsCommand(
         assistant: mergedConfig.assistant,
         aliases: mergedConfig.aliases,
         tiers: mergedConfig.tiers,
+        // Normalize through the provider's own parser: config YAML is not schema
+        // -validated, so an unrecognized entry must be dropped here exactly as it
+        // is at run time, or validation and execution disagree about the node's
+        // effective sources.
+        claudeSettingSources: parseClaudeSettingSources(
+          mergedConfig.assistants.claude?.settingSources
+        ).value,
+        claudeConfigDir: mergedConfig.envVars?.CLAUDE_CONFIG_DIR,
       },
       defaultProvider
     );
+
+    // Surface parse-time unknown-key warnings (#2213) as validation issues
+    if (parseWarnings && parseWarnings.length > 0) {
+      for (const warning of parseWarnings) {
+        issues.push({ level: 'warning', field: 'unknown_key', message: warning });
+      }
+    }
+
     results.push(makeWorkflowResult(workflow.name, issues));
   }
 
@@ -133,12 +151,12 @@ export async function validateWorkflowsCommand(
       const allNames = results.map(r => r.workflowName);
       const similar = findSimilar(name, allNames);
       if (json) {
-        console.log(
-          JSON.stringify({
+        await writeStdout(
+          `${JSON.stringify({
             error: `Workflow '${name}' not found`,
             suggestions: similar,
             available: allNames,
-          })
+          })}\n`
         );
       } else {
         console.error(`Workflow '${name}' not found.`);
@@ -166,8 +184,8 @@ export async function validateWorkflowsCommand(
   ).length;
 
   if (json) {
-    console.log(
-      JSON.stringify({
+    await writeStdout(
+      `${JSON.stringify({
         results: filteredResults,
         summary: {
           total: filteredResults.length,
@@ -175,7 +193,7 @@ export async function validateWorkflowsCommand(
           errors: totalErrors,
           warnings: totalWarnings,
         },
-      })
+      })}\n`
     );
   } else {
     console.log(`\nValidating workflows in ${cwd}\n`);
@@ -215,7 +233,7 @@ export async function validateCommandsCommand(
     const result = await validateCommand(name, cwd, config);
 
     if (jsonOutput) {
-      console.log(JSON.stringify(result));
+      await writeStdout(`${JSON.stringify(result)}\n`);
     } else {
       const statusLabel = result.valid ? 'ok' : 'ERRORS';
       console.log(`\n  ${result.commandName.padEnd(40, ' ')} ${statusLabel}`);
@@ -242,8 +260,8 @@ export async function validateCommandsCommand(
   const totalErrors = totalCommandErrors + totalScriptErrors;
 
   if (jsonOutput) {
-    console.log(
-      JSON.stringify({
+    await writeStdout(
+      `${JSON.stringify({
         results: commandResults,
         scripts: scriptResults,
         summary: {
@@ -251,7 +269,7 @@ export async function validateCommandsCommand(
           valid: commandResults.length + scriptResults.length - totalErrors,
           errors: totalErrors,
         },
-      })
+      })}\n`
     );
   } else {
     if (commandResults.length === 0 && scriptResults.length === 0) {

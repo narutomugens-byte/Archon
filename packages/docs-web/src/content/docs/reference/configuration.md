@@ -29,7 +29,7 @@ Archon supports a layered configuration system with sensible defaults, optional 
 └── config.yaml             # Global configuration (optional)
 ```
 
-Home-scoped `workflows/`, `commands/`, and `scripts/` apply to every project on the machine. Repo-local files at `<repoRoot>/.archon/{workflows,commands,scripts}/` override them by filename (or script name). Each directory supports one level of subfolders for grouping; deeper nesting is ignored. See [Global Workflows](/guides/global-workflows/) for details and dotfiles-sync examples.
+Home-scoped `workflows/`, `commands/`, and `scripts/` apply to every project on the machine. Repo-local legacy/shared files at `<repoRoot>/.archon/{workflows,commands,scripts}/` override them by filename (or script name). Shared/grouped layouts support one subfolder; packaged workflows use exactly `workflows/<pack>/<workflow>/` with one YAML directly inside. Package-owned commands and scripts do not fall through across scopes. See [Global Workflows](/guides/global-workflows/) for details and dotfiles-sync examples.
 
 ### Repository-Level (.archon/)
 
@@ -186,7 +186,18 @@ without a `tiers:` block. Other providers must configure any tier they use, or r
 
 ### Claude settingSources
 
-Controls which sources the Claude Agent SDK loads during sessions — `CLAUDE.md`, skills, commands, agents, and hooks:
+Controls which sources the Claude Agent SDK discovers during sessions — `CLAUDE.md`, skills, commands, agents, and hooks. In workflow nodes, discovery does not activate ambient skills: the node's `skills:` list remains the exact active set, and omission/`[]` selects none.
+
+A declared skill that is installed on disk must live under a source that remains
+enabled — `settingSources: ['project']` cannot select a user-global skill, for
+instance — and Archon rejects that mismatch before provider spend. Names that are
+absent from disk entirely, such as Claude's built-in skills and plugin-qualified
+`plugin:skill` entries, are left to the SDK to resolve.
+
+Unrecognized entries are dropped rather than ignored: `settingSources: ['projct']`
+resolves to no sources and logs `claude.setting_sources_invalid_entries`. A typo
+therefore narrows and reports itself, instead of falling back to the permissive
+`['project', 'user']` default.
 
 | Value | Description |
 |-------|-------------|
@@ -299,7 +310,36 @@ container:
   write_back: approve # 'approve' (default) pauses at a write-back gate; 'auto' applies without pausing
 ```
 
-**Prerequisites:** Docker, and the runner image built once with `bun run build:runner-image` (tags `archon-runner:<version>` + `:latest`). Container mode is **folder-project-only** (a repo project errors). Pausing workflows (approval/interactive gates) **are** supported — a pause `docker stop`s the container (near-zero resources while awaiting a decision) and resume rediscovers and restarts it. `$ARTIFACTS_DIR` is not mounted into the container (see [variables](/reference/variables/)). For the full flow, pause economics, and security posture, see the [Container isolation guide](/guides/container-isolation/) and `packages/isolation/docker/SECURITY.md`.
+**Prerequisites:** Docker, and the runner image built once with `bun run build:runner-image` (tags `archon-runner:<version>` + `:latest`). Container mode is **folder-project-only** (a repo project errors). Pausing workflows (approval/interactive gates) **are** supported — a pause `docker stop`s the container (near-zero resources while awaiting a decision) and resume rediscovers and restarts it. Neither `$ARTIFACTS_DIR` nor `$STATE_DIR` is mounted into the container — see [Container runs and run output](#container-runs-and-run-output) below. For the full flow, pause economics, and security posture, see the [Container isolation guide](/guides/container-isolation/) and `packages/isolation/docker/SECURITY.md`.
+
+### Container runs and run output
+
+Container runs are the one place where a run's output is **not** addressable from the host
+filesystem by run id. This is a documented limitation, not an oversight — the accurate
+picture:
+
+- A container run has exactly two mounts: the project root at `/mnt/lower` (read-only) and
+  the per-run overlay volume at `/mnt/upper`. `ARCHON_HOME` is never mounted.
+- `ARTIFACTS_DIR` and `STATE_DIR` reach the container only as environment variables, so a
+  node that writes to either from *inside* the container writes into the container's own
+  ephemeral layer, not to the host.
+- The container is **not** destroyed when the run completes. It is removed by the cleanup
+  service (7-day stale window by default) or by an explicit teardown, and `destroy()`
+  removes the container *and* its volume. Until then those files remain readable with
+  `docker exec`.
+
+Net effect: container-run output is a roughly 7-day TTL on an ephemeral container layer,
+reachable by `docker exec`, and **not** addressable by run id from the host. Retrieval is
+therefore non-uniform — "point an agent at run X's artifacts" is a filesystem path for
+every other run, and a `docker exec` into a specific container within the cleanup window
+for a container run. The blast radius is bounded: container mode is folder-projects-only
+and works only with `containerExec`-capable providers.
+
+**Workaround.** A node whose output must reach the host should write into the **project
+root** — the node's working directory inside the container, which is the overlay mount —
+rather than into `$ARTIFACTS_DIR` / `$STATE_DIR`. A plain relative path does this. Writes
+there ride the existing overlay diff plus the approval-gated write-back, so they do land on
+the host.
 
 ## Environment Variables
 

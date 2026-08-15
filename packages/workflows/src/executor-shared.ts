@@ -6,13 +6,25 @@
  * utilities. Single source of truth; no logic changes from either copy.
  */
 import { readFile } from 'fs/promises';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
 import type { LoadCommandResult } from './schemas';
+import { INPUT_NAME_SOURCE } from './schemas/dag-node';
+import { similarNodeIds } from './output-ref';
+import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
+
+/**
+ * Runtime `$INPUTS.<name>` reference — the sub-run twin of the include-expander's
+ * load-time INPUTS_REF, built from the same identifier grammar so a name that
+ * validates as a `with:` key can never fail to match here. Resolved only for
+ * `workflow:` sub-runs (child runs get `metadata.inputs`), and only into non-shell
+ * surfaces (shell nodes get `INPUTS_<UPPER_SNAKE>` env vars instead — see #2470).
+ */
+const INPUTS_RUNTIME_REF = new RegExp(String.raw`\$INPUTS\.(${INPUT_NAME_SOURCE})`, 'g');
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -40,11 +52,13 @@ export const FATAL_PATTERNS = [
   '401',
   '403',
   'credit balance',
-  'auth error',
   'session limit', // Claude subscription 5h window — covers every detectCreditExhaustion session variant
   'usage limit reached', // Claude CLI quota string, e.g. "Claude AI usage limit reached|<ts>"
   'credit exhaustion', // synthesized "Credit exhaustion detected — resume when credits reset"
 ];
+
+/** Ambiguous fatal patterns that yield to concrete transient evidence. */
+const FALLBACK_FATAL_PATTERNS = ['auth error'];
 
 /** Transient error patterns - temporary issues that may resolve with retry */
 export const TRANSIENT_PATTERNS = [
@@ -59,6 +73,7 @@ export const TRANSIENT_PATTERNS = [
   '502',
   '529', // Anthropic HTTP 529 = service overloaded
   'overloaded', // Anthropic/Minimax overload message text
+  'at capacity', // Codex/OpenAI model-level saturation
   'network error',
   'socket hang up',
   'exited with code',
@@ -74,8 +89,10 @@ export function matchesPattern(message: string, patterns: string[]): boolean {
 
 /**
  * Classify an error to determine if it's transient (can retry) or fatal (should fail).
- * FATAL patterns take priority over TRANSIENT patterns to prevent an error message
+ * Decisive FATAL patterns take priority over TRANSIENT patterns to prevent an error
  * containing both (e.g. "unauthorized: process exited with code 1") from being retried.
+ * Ambiguous provider wrapper text such as "auth error" is fatal only when no concrete
+ * transient signal matches.
  */
 export function classifyError(error: Error): ErrorType {
   const message = error.message.toLowerCase();
@@ -85,6 +102,9 @@ export function classifyError(error: Error): ErrorType {
   }
   if (matchesPattern(message, TRANSIENT_PATTERNS)) {
     return 'TRANSIENT';
+  }
+  if (matchesPattern(message, FALLBACK_FATAL_PATTERNS)) {
+    return 'FATAL';
   }
   return 'UNKNOWN';
 }
@@ -252,7 +272,7 @@ export function detectCreditExhaustion(text: string): string | null {
  * @returns On success: `{ success: true, content }`. On failure: `{ success: false, reason, message }`.
  */
 export async function loadCommandPrompt(
-  deps: WorkflowDeps,
+  deps: Pick<WorkflowDeps, 'loadConfig'>,
   cwd: string,
   commandName: string,
   configuredFolder?: string
@@ -282,6 +302,82 @@ export async function loadCommandPrompt(
       'config_load_failed_using_defaults'
     );
     config = { defaults: { loadDefaultCommands: true } };
+  }
+
+  const packaged = parsePackagedResourceReference(commandName);
+  if (packaged !== null) {
+    if (packaged.owner.source === 'bundled') {
+      if (config.defaults?.loadDefaultCommands === false) {
+        return {
+          success: false,
+          reason: 'not_found',
+          message: `Packaged command not found: ${packaged.name}.md`,
+        };
+      }
+      if (isBinaryBuild()) {
+        const content = BUNDLED_COMMANDS[commandName];
+        if (content === undefined) {
+          return {
+            success: false,
+            reason: 'not_found',
+            message: `Packaged command not found: ${packaged.name}.md`,
+          };
+        }
+        if (!content.trim()) {
+          return {
+            success: false,
+            reason: 'empty_file',
+            message: `Command file is empty: ${packaged.name}.md`,
+          };
+        }
+        return { success: true, content };
+      }
+    }
+
+    let workflowsRoot: string;
+    if (packaged.owner.source === 'project') {
+      workflowsRoot = join(cwd, '.archon', 'workflows');
+    } else if (packaged.owner.source === 'global') {
+      workflowsRoot = archonPaths.getHomeWorkflowsPath();
+    } else {
+      workflowsRoot = dirname(archonPaths.getDefaultWorkflowsPath());
+    }
+    const filePath = join(
+      getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
+      `${packaged.name}.md`
+    );
+    try {
+      const content = await readFile(filePath, 'utf-8');
+      if (!content.trim()) {
+        return {
+          success: false,
+          reason: 'empty_file',
+          message: `Command file is empty: ${filePath}`,
+        };
+      }
+      return { success: true, content };
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      let reason: 'permission_denied' | 'not_found' | 'read_error';
+      if (err.code === 'EACCES') {
+        reason = 'permission_denied';
+      } else if (err.code === 'ENOENT') {
+        reason = 'not_found';
+      } else {
+        reason = 'read_error';
+      }
+      if (err.code !== 'ENOENT') {
+        getLog().error({ err, commandName, filePath }, 'packaged_command_file_read_error');
+      }
+      return {
+        success: false,
+        reason,
+        message:
+          err.code === 'ENOENT'
+            ? `Packaged command not found: ${filePath}`
+            : `Error reading packaged command ${filePath}: ${err.message}`,
+      };
+    }
   }
 
   // Use command folder paths with optional configured folder.
@@ -404,6 +500,9 @@ export const CONTEXT_VAR_PATTERN_STR =
  * - $WORKFLOW_ID - The workflow run ID
  * - $USER_MESSAGE, $ARGUMENTS - The user's trigger message
  * - $ARTIFACTS_DIR - External artifacts directory for this workflow run
+ * - $STATE_DIR - External per-PROJECT cross-run state directory (shared by every
+ *   workflow in the project; pre-created by the executor). Throws if referenced
+ *   without a resolved value.
  * - $BASE_BRANCH - The base branch (from config or auto-detected)
  * - $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT - GitHub issue/PR context (if available)
  * - $DOCS_DIR - Documentation directory path (configured or default 'docs/')
@@ -413,6 +512,9 @@ export const CONTEXT_VAR_PATTERN_STR =
  * - $LOOP_PREV_OUTPUT - Cleaned output of the previous loop iteration. Empty string on the
  *   first iteration (no prior output exists). Useful for fresh_context loops that need
  *   to reference what the previous pass produced or why it failed.
+ * - $INPUTS.<name> - Named sub-run inputs (#2470), supplied by a caller's `with:` on a
+ *   `workflow:` node. Resolved from `options.inputs` in the non-shell branch only; an
+ *   unknown name THROWS. Shell (bash/script) nodes read `INPUTS_<UPPER_SNAKE>` env vars.
  *
  * When issueContext is undefined, context variables are replaced with empty string
  * to avoid sending literal "$CONTEXT" to the AI.
@@ -428,13 +530,25 @@ export function substituteWorkflowVariables(
   loopUserInput?: string,
   rejectionReason?: string,
   loopPrevOutput?: string,
-  options?: { shellSafe?: boolean }
+  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, string> }
 ): { prompt: string; contextSubstituted: boolean } {
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
   if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
     throw new Error(
       'No base branch could be resolved. Auto-detection failed and `worktree.baseBranch` is not set in .archon/config.yaml. ' +
         'Set the config value or use the --from flag to select a branch (e.g., --from dev).'
+    );
+  }
+
+  // Same fail-fast for $STATE_DIR. The state directory is threaded from the
+  // executor to every substitution site; a site that forgot to pass it would
+  // otherwise leave the variable literal (AI nodes) or empty (shell nodes),
+  // silently writing state to the wrong place. Loud beats silent.
+  if (!options?.stateDir && prompt.includes('$STATE_DIR')) {
+    throw new Error(
+      '$STATE_DIR is referenced but no state directory was resolved for this run. ' +
+        '$STATE_DIR is only available inside a workflow run; if you are seeing this from a workflow node, ' +
+        'please report it as a bug.'
     );
   }
 
@@ -447,6 +561,9 @@ export function substituteWorkflowVariables(
   let result = prompt
     .replace(/\$WORKFLOW_ID/g, workflowId)
     .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
+    // Engine-controlled like $ARTIFACTS_DIR — substituted even under shellSafe,
+    // or `bash:`/`script:` bodies would never see it.
+    .replace(/\$STATE_DIR/g, options?.stateDir ?? '')
     .replace(/\$BASE_BRANCH/g, baseBranch)
     .replace(/\$DOCS_DIR/g, resolvedDocsDir);
 
@@ -457,6 +574,26 @@ export function substituteWorkflowVariables(
       .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
       .replace(/\$REJECTION_REASON/g, rejectionReason ?? '')
       .replace(/\$LOOP_PREV_OUTPUT/g, loopPrevOutput ?? '');
+
+    // $INPUTS.<name> — named sub-run inputs (#2470). Substituted ONLY in the non-shell
+    // branch: a sub-run's input value can derive from AI output (e.g. `with: {plan:
+    // $plan.output}`), the exact user-controlled class shellSafe keeps out of shell
+    // source (#2115). Bash/script bodies read INPUTS_<UPPER_SNAKE> env vars instead.
+    // An unknown name THROWS (mirrors $node.output.field strictness) rather than
+    // substituting '' — a typo'd input silently emptying is worse than a load-visible error.
+    const inputs = options?.inputs;
+    result = result.replace(INPUTS_RUNTIME_REF, (_match, name: string) => {
+      if (inputs && Object.hasOwn(inputs, name)) return inputs[name];
+      const known = inputs ? Object.keys(inputs) : [];
+      const hint = similarNodeIds(name, known);
+      const suffix =
+        hint.length > 0
+          ? ` Did you mean ${hint.map(h => `$INPUTS.${h}`).join(', ')}?`
+          : known.length > 0
+            ? ` Available inputs: ${known.map(k => `$INPUTS.${k}`).join(', ')}.`
+            : ' This run has no declared inputs.';
+      throw new Error(`Unknown input '$INPUTS.${name}'.${suffix}`);
+    });
   }
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
@@ -495,6 +632,8 @@ export function substituteWorkflowVariables(
  * @param docsDir - The resolved docs directory for $DOCS_DIR substitution
  * @param issueContext - Optional GitHub issue/PR context to substitute or append
  * @param logLabel - Human-readable label for logging (e.g., 'workflow step prompt')
+ * @param options - Forwarded to {@link substituteWorkflowVariables}; carries `stateDir`
+ *   for `$STATE_DIR`, which throws when referenced without one.
  * @returns The final prompt with variables substituted and context optionally appended
  */
 export function buildPromptWithContext(
@@ -505,7 +644,8 @@ export function buildPromptWithContext(
   baseBranch: string,
   docsDir: string,
   issueContext: string | undefined,
-  logLabel: string
+  logLabel: string,
+  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, string> }
 ): string {
   const { prompt, contextSubstituted } = substituteWorkflowVariables(
     template,
@@ -514,7 +654,11 @@ export function buildPromptWithContext(
     artifactsDir,
     baseBranch,
     docsDir,
-    issueContext
+    issueContext,
+    undefined,
+    undefined,
+    undefined,
+    options
   );
 
   if (issueContext && !contextSubstituted) {

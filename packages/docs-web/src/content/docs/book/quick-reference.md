@@ -25,7 +25,7 @@ This chapter collects every CLI command, variable, and YAML option in one place.
 | `archon workflow run <name> --no-worktree "<prompt>"` | Run in the live checkout (no isolation) |
 | `archon workflow run <name> --cwd /path "<prompt>"` | Run against a specific directory |
 | `archon workflow status` | Show status of active workflow runs |
-| `archon workflow resume <run-id>` | Resume a failed workflow run |
+| `archon workflow resume <run-id>` | Resume a failed or paused workflow run |
 | `archon workflow abandon <run-id>` | Abandon a workflow run (running, paused, or failed) |
 | `archon workflow cleanup [days]` | Delete old workflow run records (default: 7 days) |
 
@@ -73,7 +73,7 @@ Variables are substituted at runtime in command bodies and workflow `prompt:` fi
 | `$ARGUMENTS` / `$USER_MESSAGE` | Commands, prompts | The user's whole trigger message (positional `$1`/`$2`/`$3` are not supported) |
 | `$ARTIFACTS_DIR` | Commands, prompts | Absolute path to the workflow run's artifact directory |
 | `$WORKFLOW_ID` | Commands, prompts | The current workflow run ID |
-| `$BASE_BRANCH` | Commands, prompts | Base git branch (auto-detected or set via `worktree.baseBranch`) |
+| `$BASE_BRANCH` | Commands, prompts | Base git branch -- `--base <branch>` (per dispatch), else `worktree.baseBranch`, else the codebase default, else auto-detected ([precedence](/reference/cli/#base-branch-precedence)) |
 | `$DOCS_DIR` | Commands, prompts | Documentation directory path (default: `docs/`) |
 | `$<nodeId>.output` | DAG `when:` conditions, downstream `prompt:` fields | The text output from a completed node |
 
@@ -119,10 +119,10 @@ All nodes share these base fields:
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
 | `id` | Yes | string | Unique node identifier; used in `depends_on` and `$nodeId.output` |
-| `command` | One of | string | Name of a command file in `.archon/commands/` |
+| `command` | One of | string | Package-local command name (packaged workflow) or shared command name (legacy workflow) |
 | `prompt` | One of | string | Inline AI instructions |
 | `bash` | One of | string | Shell script (runs without AI; stdout captured as `$nodeId.output`) |
-| `script` | One of | string | TypeScript/JavaScript (bun) or Python (uv) — inline or named ref to `.archon/scripts/`. Requires `runtime`. See [Script Nodes](/guides/script-nodes/) |
+| `script` | One of | string | TypeScript/JavaScript (bun) or Python (uv) — inline or named package-local/shared reference. Requires `runtime`. See [Script Nodes](/guides/script-nodes/) |
 | `loop` | One of | object | Loop configuration (see Loop Options below) |
 | `loop_group` | One of | object | Multi-node sub-DAG repeated per iteration (see Loop Group Options below) |
 | `approval` | One of | object | Pause for human review; see [Approval Nodes](/guides/approval-nodes/) |
@@ -142,7 +142,7 @@ All nodes share these base fields:
 | `retry` | No | object | Retry configuration for transient failures (see Retry Options). **Hard error on loop nodes** |
 | `hooks` | No | object | SDK hook callbacks (Claude only; see Hook Schema) |
 | `mcp` | No | string | Path to MCP server config JSON file (Claude only) |
-| `skills` | No | string[] | Skill names to preload into this node's context (Claude only) |
+| `skills` | No | string[] | Declared skill names for this node; Claude omission/`[]` selects none |
 | `agents` | No | object | Inline sub-agent definitions keyed by kebab-case ID. Claude only |
 
 **Script-specific fields** (required when `script:` is set):
@@ -158,9 +158,11 @@ All nodes share these base fields:
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
 | `input` | No | string | Data string forwarded as the child's `$ARGUMENTS`. Substituted like a `prompt:` body (`$nodeId.output`, workflow variables) |
-| `isolation` | No | `'inherit'` | Only `'inherit'` (shared checkout) is supported; `'worktree'` is reserved and rejected at load time (slice 2) |
+| `with` | No | object | Named string values forwarded as the child's `$INPUTS`. Keys must be valid input identifiers. Mutually exclusive with `input` |
+| `isolation` | No | `'inherit' \| 'worktree'` | Which checkout the child runs in. Default (and `'inherit'`) shares the parent's. `'worktree'` gives the child its own worktree + branch — opt-in only, never inferred, and it fails the node rather than falling back to the shared checkout when a worktree can't be created (folder projects, surfaces with no resolver) |
+| `fan_out` | No | object | Run one child per item of a runtime list: `items` (a `$node.output` ref or literal JSON array), `max_parallel` (default `5`, bounds concurrency not total), `join` (default `all_done`), `as` (names the item as `$INPUTS.<as>` and must not collide with `with`). Every child runs to its own terminal state; none cancels another |
 
-`retry` is rejected on `workflow:` nodes, and `workflow:` is rejected inside a `loop_group` body. The child's terminal output threads back as `$nodeId.output`; a child approval gate pauses the whole tree — approve the **child** by run id and the parent auto-resumes.
+`retry` is rejected on `workflow:` nodes, and `workflow:` is rejected inside a `loop_group` body. The child's terminal output threads back as `$nodeId.output`; a child approval gate pauses the whole tree — approve the **child** by run id and the parent auto-resumes. A child gate is the exception: it works for a 1:1 sub-run, but a child that pauses inside a `fan_out:` expansion **fails the node** instead — a parent has one approval slot and cannot hand it to N children, so gate before or after the fan-out node rather than inside a child of it.
 
 **Approval-specific fields** (required when `approval:` is set):
 
@@ -189,7 +191,7 @@ Defined under `loop:` inside a node:
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
 | `prompt` | One of `prompt`/`command` | string | Inline AI instructions executed each iteration |
-| `command` | One of `prompt`/`command` | string | Command file (under `.archon/commands/`) whose body is the iteration prompt — exactly one of `prompt` or `command` |
+| `command` | One of `prompt`/`command` | string | Package-local or shared command whose body is the iteration prompt — exactly one of `prompt` or `command` |
 | `until` | Yes | string | Completion signal string — loop ends when AI output contains this |
 | `max_iterations` | Yes | number | Maximum iterations before the node fails |
 | `fresh_context` | No | boolean | Start a new session each iteration (default: false) |
@@ -339,7 +341,7 @@ defaults:
 | Error | Likely Cause | Fix |
 |-------|-------------|-----|
 | `Workflow "X" not found` | YAML file not discovered | Check file is in `.archon/workflows/` and `archon workflow list` shows it |
-| `Command "X" not found` | Command file missing | Check `.archon/commands/X.md` exists and `archon validate commands X` passes |
+| `Command "X" not found` | Command file missing | For a packaged workflow, check its own `commands/X.md` and run `archon validate workflows <name>`; otherwise check the shared command path and run `archon validate commands X` |
 | `Routing unclear — falling back to archon-assist` | No workflow matched the input | Use an explicit workflow name: `archon workflow run my-workflow "..."` |
 | `Worktree already exists for branch X` | Prior run left a worktree | Run `archon complete X` or `archon isolation cleanup` |
 | `Not a git repository` | Running outside a repo | `cd` into a git repo first — workflow and isolation commands require one |

@@ -1,0 +1,459 @@
+name: archon-auto-build
+description: |
+  EXPERIMENTAL (cross-model): the terminal `/auto` replacement, as an Archon
+  workflow. An autonomous plan → implement → validate → PR → review → self-fix →
+  simplify → smoke → report pipeline for a FREE-FORM task description (NOT a
+  GitHub issue). Generalized from archon-fix-github-issue-routed: it keeps that
+  workflow's proven back half verbatim (writable-remote draft PR, cross-fork-safe
+  push, review fan-out, Kimi self-fix) and replaces the issue-specific front
+  (fetch/classify/investigate) with a single free-form plan step.
+
+  MODEL ROUTING (Opus plans, Kimi codes, Opus reviews):
+    - Workflow default stays Claude (plan/validate/review/simplify/smoke/report).
+    - The plan node is pinned to model: large (Opus tier) — it decides WHAT Kimi
+      will build.
+    - ONLY the two code-WRITING nodes (implement, self-fix) route to Kimi via the
+      pi provider (provider: pi, model: kimi-coding/kimi-for-coding). The simplify
+      node stays on Claude (a small quality/altitude pass, not bulk code-writing).
+
+  Fully autonomous — there is NO mid-run approval gate. The DRAFT PR it opens is
+  the human gate: nothing merges without a person. Because there is no gate and
+  Kimi nodes run headless, the whole run is CLI-driven.
+
+  Run via the headless CLI, not the dashboard — pi/Kimi nodes zombie on the
+  Windows dashboard (Bash tool-result delivery hangs). Requires `pi /login` ->
+  Kimi For Coding (auth.json); do NOT put KIMI_API_KEY in ~/.archon/.env
+  (override:true force-injects a stale key -> 401).
+
+  Use when: User wants to BUILD/IMPLEMENT a free-form feature or change
+  end-to-end with Opus planning + Kimi coding, ending in a reviewed draft PR.
+  Triggers: "auto-build X", "build X with kimi", "opus-plan kimi-code X".
+  NOT for: Fixing a specific GitHub issue (use archon-fix-github-issue-routed),
+           questions about the codebase, standalone PR reviews, or plan-only asks.
+
+provider: claude
+model: medium
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: PLAN  (Opus tier — decides what Kimi implements)
+  # archon-create-plan takes the free-form task as $ARGUMENTS, runs its own
+  # codebase-explore + external research, and writes $ARTIFACTS_DIR/plan.md.
+  # This is the reasoning that decides WHAT Kimi will build; Opus plans, Kimi codes.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-plan
+    command: archon-create-plan
+    context: fresh
+    provider: claude
+    model: large
+
+  # Bridge: archon-create-plan writes plan.md, but the implement command
+  # (archon-fix-issue) reads investigation.md. Copy plan.md -> investigation.md so
+  # the implement step finds its input. (Same bridge the routed workflow uses.)
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md to investigation.md for implement step"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md already exists"
+      else
+        echo "WARNING: no plan.md or investigation.md found — implement may fail" >&2
+      fi
+    depends_on: [create-plan]
+
+  # Pre-warm dependencies. Archon worktrees are BARE (only .archon is copied — no
+  # node_modules), and the implement command's own install phase is prompt-level,
+  # so an agent that skips it leaves `validate` failing for a missing-deps reason
+  # that reads like a code failure. Installing here makes it deterministic.
+  - id: install-deps
+    depends_on: [bridge-artifacts]
+    timeout: 600000
+    bash: |
+      set -euo pipefail
+      unset GIT_DIR GIT_WORK_TREE
+      if [ ! -f package.json ]; then
+        echo "No package.json in the worktree — nothing to install"
+        exit 0
+      fi
+      if [ -d node_modules ]; then
+        echo "node_modules already present — skipping install"
+        exit 0
+      fi
+      if [ -f bun.lock ] || [ -f bun.lockb ]; then
+        INSTALL="bun install"
+      elif [ -f pnpm-lock.yaml ]; then
+        INSTALL="pnpm install"
+      elif [ -f yarn.lock ]; then
+        INSTALL="yarn install"
+      else
+        INSTALL="npm install"
+      fi
+      INSTALL_BIN=${INSTALL%% *}
+      if ! command -v "$INSTALL_BIN" >/dev/null 2>&1; then
+        echo "'$INSTALL_BIN' is not on PATH — the worktree cannot be prepared, and every" >&2
+        echo "downstream validate/test step would fail for the wrong reason. Launch the run" >&2
+        echo "from a shell where '$INSTALL_BIN' resolves." >&2
+        exit 1
+      fi
+      echo "Installing dependencies with: $INSTALL"
+      $INSTALL
+      echo "Dependencies installed"
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: IMPLEMENT  (Kimi codes)
+  # Routed to the pi provider / Kimi For Coding. Opus already decided what to
+  # change in the plan; Kimi makes the edits, validates, and commits.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    command: archon-fix-issue
+    depends_on: [install-deps]
+    context: fresh
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    allowed_tools: [Read, Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: CREATE DRAFT PR
+  # ═══════════════════════════════════════════════════════════════
+
+  # Pick the remote we can actually push to. A contributor normally has READ on
+  # the upstream and write only on their own fork, so a hard-coded `origin` push
+  # 403s and kills the run before the review phase ever starts. Prefer origin
+  # when it is writable; otherwise fall back to the first writable remote.
+  - id: resolve-pr-remote
+    bash: |
+      set -euo pipefail
+      unset GIT_DIR GIT_WORK_TREE
+      PICKED=""
+      for REMOTE in $(git remote); do
+        URL=$(git remote get-url "$REMOTE")
+        PERM=$(gh repo view "$URL" --json viewerPermission -q '.viewerPermission' 2>/dev/null || echo "")
+        case "$PERM" in
+          WRITE|MAINTAIN|ADMIN)
+            if [ "$REMOTE" = "origin" ]; then
+              PICKED="$REMOTE"
+              break
+            fi
+            if [ -z "$PICKED" ]; then
+              PICKED="$REMOTE"
+            fi
+            ;;
+        esac
+      done
+      if [ -z "$PICKED" ]; then
+        echo "No git remote grants push access — cannot open a PR" >&2
+        exit 1
+      fi
+      echo "$PICKED"
+    depends_on: [validate]
+
+  - id: create-pr
+    prompt: |
+      Create a draft pull request for the current branch.
+
+      ## Context
+
+      - **Task**: $ARGUMENTS
+      - **Push remote**: $resolve-pr-remote.output (the only remote you have write access to)
+
+      Read `$ARTIFACTS_DIR/plan.md` for the feature title and summary.
+
+      ## Instructions
+
+      1. Check git status. If uncommitted changes exist, stage and commit ONLY source files that are part of the change:
+         - List them by name with `git add <path1> <path2> ...` — never `git add -A`, `git add .`, or `git add -u`
+         - **Never commit** scratch / review / PR-body artifacts, even if they appear in `git status`:
+           - `.pr-body.md`, `pr-body.md`, `*.scratch.md`, `*.tmp.md` at any path
+           - `review/`, `*-report.md` at the repo root
+           - Anything under `$ARTIFACTS_DIR`
+         - Verify with `git status --porcelain` that nothing scratch is staged before committing
+         - If files you don't recognize as part of the change appear modified or untracked, leave them alone
+      2. Push the branch to the write-accessible remote, then work out where the PR opens.
+         The branch is pushed to whichever remote you can write to (often a fork), but the
+         PR always TARGETS the upstream (`origin`) — that is the normal fork-contribution
+         flow, and it keeps the downstream review commands (which call bare `gh pr view`)
+         pointed at the same repo. Run exactly this:
+         ```bash
+         PUSH_REMOTE=$resolve-pr-remote.output
+         git push -u "$PUSH_REMOTE" HEAD
+         HEAD_BRANCH=$(git branch --show-current)
+         PUSH_OWNER=$(gh repo view "$(git remote get-url $PUSH_REMOTE)" --json owner -q '.owner.login')
+         PR_REPO=$(gh repo view "$(git remote get-url origin)" --json nameWithOwner -q '.nameWithOwner')
+         UPSTREAM_OWNER=$(gh repo view "$(git remote get-url origin)" --json owner -q '.owner.login')
+         # A cross-fork PR needs an owner-qualified head ref; a same-repo PR must not have one.
+         if [ "$PUSH_OWNER" = "$UPSTREAM_OWNER" ]; then
+           PR_HEAD="$HEAD_BRANCH"
+         else
+           PR_HEAD="$PUSH_OWNER:$HEAD_BRANCH"
+         fi
+         ```
+         Use `$PR_REPO` and `$PR_HEAD` in every `gh pr` command below.
+      3. Read implementation artifacts from `$ARTIFACTS_DIR/` for context:
+         - `$ARTIFACTS_DIR/plan.md`
+         - `$ARTIFACTS_DIR/implementation.md`
+         - `$ARTIFACTS_DIR/validation.md`
+      4. Check if a PR already exists for this branch: `gh pr list --repo "$PR_REPO" --head "$PR_HEAD"`
+         - If PR exists, skip creation and capture its number
+      5. Look for the project's PR template at `.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, or `docs/PULL_REQUEST_TEMPLATE.md`. Read whichever one exists.
+      6. Create a DRAFT PR: `gh pr create --repo "$PR_REPO" --draft --base $BASE_BRANCH --head "$PR_HEAD"`
+         - Title: concise, imperative mood, under 70 chars
+         - Body: if a PR template was found, fill in **every section** with details from the artifacts. Don't skip sections or leave placeholders. If no template, write a body with summary, changes, and validation evidence.
+         - **PR body file location**: if you write the body to a file (e.g. for `--body-file`), the file MUST live at `$ARTIFACTS_DIR/pr-body.md` or under `/tmp/` — NEVER inside the worktree. Files like `.pr-body.md` at the repo root will be picked up by later commits.
+      7. Capture PR identifiers:
+         ```bash
+         PR_NUMBER=$(gh pr list --repo "$PR_REPO" --head "$PR_HEAD" --state open --json number -q '.[0].number')
+         if [ -z "$PR_NUMBER" ]; then
+           echo "No open PR found for branch $HEAD_BRANCH — PR creation failed" >&2
+           exit 1
+         fi
+         echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+         echo "$PR_REPO" > "$ARTIFACTS_DIR/.pr-repo"
+         PR_URL=$(gh pr view "$PR_NUMBER" --repo "$PR_REPO" --json url -q '.url')
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+    depends_on: [resolve-pr-remote]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: REVIEW  (Opus reviews what Kimi wrote)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      unset GIT_DIR GIT_WORK_TREE
+      # create-pr recorded the PR it actually opened — read those rather than
+      # re-deriving from the branch, which is ambiguous for a cross-fork head ref.
+      PR_REPO=$(cat "$ARTIFACTS_DIR/.pr-repo")
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
+      if [ -z "$PR_NUMBER" ]; then
+        echo "create-pr recorded no PR number in $ARTIFACTS_DIR/.pr-number" >&2
+        exit 1
+      fi
+      EXPECTED="$BASE_BRANCH"
+      ACTUAL=$(gh pr view "$PR_NUMBER" --repo "$PR_REPO" --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        echo "Base mismatch on PR #$PR_NUMBER: expected=$EXPECTED actual=$ACTUAL — re-targeting" >&2
+        gh pr edit "$PR_NUMBER" --repo "$PR_REPO" --base "$EXPECTED"
+      else
+        echo "PR base verified: $EXPECTED"
+      fi
+    depends_on: [create-pr]
+
+  - id: review-scope
+    command: archon-pr-review-scope
+    depends_on: [verify-pr-base]
+    context: fresh
+
+  - id: review-classify
+    prompt: |
+      You are a PR review classifier. Analyze the PR scope and determine
+      which review agents should run.
+
+      ## PR Scope
+
+      $review-scope.output
+
+      ## Rules
+
+      - **Code review**: ALWAYS run. This is mandatory for every PR. It also checks
+        the PR against CLAUDE.md rules and project conventions.
+      - **Error handling**: Run if the diff touches code with try/catch, error handling,
+        async/await, or adds new failure paths.
+      - **Test coverage**: Run if the diff touches source code (not just tests, docs, or config).
+      - **Comment quality**: Run if the diff adds or modifies comments, docstrings, JSDoc,
+        or significant documentation within code files.
+      - **Docs impact**: Run if the diff adds/removes/renames public APIs, commands, CLI flags,
+        environment variables, or user-facing features.
+      - **Security**: Run if the diff touches auth/authz, input handling, secrets/tokens,
+        webhook signatures, SQL/query building, subprocess/exec, path handling,
+        deserialization, or any external-facing/`/internal/` endpoint.
+      - **Performance**: Run if the diff touches loops over collections, database queries,
+        blocking/sync I/O in async paths, large allocations, hot paths, or caching.
+
+      Provide your reasoning for each decision.
+    depends_on: [review-scope]
+    model: small
+    allowed_tools: []
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        run_code_review:
+          type: string
+          enum: ["true", "false"]
+        run_error_handling:
+          type: string
+          enum: ["true", "false"]
+        run_test_coverage:
+          type: string
+          enum: ["true", "false"]
+        run_comment_quality:
+          type: string
+          enum: ["true", "false"]
+        run_docs_impact:
+          type: string
+          enum: ["true", "false"]
+        run_security:
+          type: string
+          enum: ["true", "false"]
+        run_performance:
+          type: string
+          enum: ["true", "false"]
+        reasoning:
+          type: string
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - run_security
+        - run_performance
+        - reasoning
+
+  # Code review always runs — mandatory
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [review-classify]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_error_handling == 'true'"
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_test_coverage == 'true'"
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_comment_quality == 'true'"
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_docs_impact == 'true'"
+    context: fresh
+
+  - id: security-review
+    command: archon-security-review-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_security == 'true'"
+    context: fresh
+
+  - id: performance-review
+    command: archon-perf-review-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_performance == 'true'"
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: SYNTHESIZE + SELF-FIX  (Kimi applies the fixes)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    command: archon-synthesize-review-ext
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact, security-review, performance-review]
+    trigger_rule: one_success
+    context: fresh
+
+  - id: self-fix
+    command: archon-self-fix-all
+    depends_on: [synthesize]
+    context: fresh
+    provider: pi
+    model: kimi-coding/kimi-for-coding
+    allowed_tools: [Read, Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: SIMPLIFY  (stays on Claude — quality/altitude pass)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8: SMOKE
+  # Prove the change actually runs, not just that it type-checks. Honest
+  # pass/skip/fail against observable evidence — never fake a pass. A smoke
+  # failure is surfaced for human judgment, not auto-fixed, so this node reports
+  # its verdict without failing the run.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: smoke
+    depends_on: [simplify]
+    context: fresh
+    provider: claude
+    model: medium
+    allowed_tools: [Read, Bash, Grep, Glob]
+    prompt: |
+      You are a smoke tester. Prove — with observable evidence — that the change on
+      this branch actually RUNS end to end. Do not re-run the unit tests (that was the
+      validate step); this is about the real app behaving.
+
+      ## Task under test
+
+      $ARGUMENTS
+
+      ## How to pick a smoke target (first match wins)
+
+      1. A `## Smoke test` block in the project `CLAUDE.md` — if present, follow it VERBATIM.
+      2. Otherwise infer from the project type:
+         - **HTTP server** (has a `dev`/`start` script that boots a server): start it in the
+           background on an unused port, poll a health/root endpoint, capture the HTTP status
+           and a snippet of the response body, then KILL the process.
+         - **CLI**: run the most representative subcommand that exercises the change and capture
+           its stdout + exit code.
+         - **Library / pure logic**: write a tiny throwaway script under `/tmp/` (NEVER inside the
+           worktree) that imports the changed module and exercises the new behavior; run it and
+           capture the output.
+      3. If you genuinely cannot identify a runnable smoke target, that is an honest SKIP — do not
+         invent one and do not claim a pass.
+
+      ## Rules
+
+      - Capture REAL evidence: an HTTP status line, a log line, a printed value, an exit code.
+        Never write "smoke passed" without the evidence that proves it.
+      - Kill every background process you start before finishing:
+        `pkill -f "bun|node|vite|next" 2>/dev/null || true`
+      - Do NOT edit source files. Read/run only.
+      - Do NOT fail the run on a smoke failure — report `fail` with the evidence and let a human decide.
+
+      ## Output
+
+      Write `$ARTIFACTS_DIR/smoke.md` with:
+      - **Status**: `pass` | `skip` | `fail`
+      - **Target**: what you ran (command / endpoint), or why you skipped
+      - **Evidence**: the actual captured output (status code, log line, printed value)
+
+      Then output the same three fields as your response so the reviewer sees the verdict.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 9: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    command: archon-workflow-summary
+    depends_on: [smoke]
+    context: fresh

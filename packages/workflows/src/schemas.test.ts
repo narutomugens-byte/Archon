@@ -15,6 +15,8 @@ import {
   BASH_NODE_AI_FIELDS,
   approvalOnRejectSchema,
   dagNodeSchema,
+  inputEnvKey,
+  readSubrunMetadata,
 } from './schemas';
 import type {
   WorkflowDefinition,
@@ -979,18 +981,45 @@ describe('dagNodeSchema — include', () => {
     expect(result.success).toBe(false);
   });
 
-  test("include with 'with:' is rejected (not yet supported)", () => {
+  test("include accepts and retains a string-valued 'with:' mapping", () => {
     const result = dagNodeSchema.safeParse({
       id: 'r',
       include: 'archon-review-block',
-      with: { pr: '$create.output' },
+      with: { pr: '$create.output', base_branch: 'main', empty: '' },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as IncludeNode).with).toEqual({
+        pr: '$create.output',
+        base_branch: 'main',
+        empty: '',
+      });
+    }
+  });
+
+  test.each([
+    ['null', null],
+    ['an array', ['main']],
+    ['a non-string value', { branch: 42 }],
+    ['an invalid key', { 'bad.key': 'main' }],
+  ])("include rejects 'with:' when it is %s", (_description, withValue) => {
+    const result = dagNodeSchema.safeParse({
+      id: 'r',
+      include: 'archon-review-block',
+      with: withValue,
     });
     expect(result.success).toBe(false);
     if (!result.success) {
-      const withIssue = result.error.issues.find(i => i.message.includes('with:'));
-      expect(withIssue).toBeDefined();
-      expect(withIssue?.message).toContain('not yet supported');
-      expect(withIssue?.path).toEqual(['with']);
+      expect(result.error.issues.some(issue => issue.path[0] === 'with')).toBe(true);
+    }
+  });
+
+  test("rejects the reserved node id 'INPUTS'", () => {
+    const result = dagNodeSchema.safeParse({ id: 'INPUTS', prompt: 'work' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const idIssue = result.error.issues.find(issue => issue.path[0] === 'id');
+      expect(idIssue?.message).toContain('$INPUTS.<name>');
     }
   });
 
@@ -1024,5 +1053,29 @@ describe('INCLUDE_NODE_IGNORED_FIELDS', () => {
     for (const f of ['id', 'depends_on', 'when', 'trigger_rule', 'include', 'description']) {
       expect(INCLUDE_NODE_IGNORED_FIELDS).not.toContain(f);
     }
+  });
+});
+
+describe('inputEnvKey (#2470)', () => {
+  test('mangles an input name to INPUTS_<UPPER_SNAKE>', () => {
+    expect(inputEnvKey('plan')).toBe('INPUTS_PLAN');
+    expect(inputEnvKey('base-branch')).toBe('INPUTS_BASE_BRANCH');
+    expect(inputEnvKey('foo_bar')).toBe('INPUTS_FOO_BAR');
+    // hyphen and underscore fold to the same key — the loader rejects such a pair.
+    expect(inputEnvKey('foo-bar')).toBe(inputEnvKey('foo_bar'));
+  });
+});
+
+describe('readSubrunMetadata — inputs (#2470)', () => {
+  test('reads a well-formed inputs map', () => {
+    const md = readSubrunMetadata({ inputs: { plan: 'do it', mode: 'fast' } });
+    expect(md.inputs).toEqual({ plan: 'do it', mode: 'fast' });
+  });
+
+  test('treats a non-string-valued or non-object inputs as unset', () => {
+    expect(readSubrunMetadata({ inputs: { plan: 5 } }).inputs).toBeUndefined();
+    expect(readSubrunMetadata({ inputs: ['a'] }).inputs).toBeUndefined();
+    expect(readSubrunMetadata({}).inputs).toBeUndefined();
+    expect(readSubrunMetadata(undefined).inputs).toBeUndefined();
   });
 });

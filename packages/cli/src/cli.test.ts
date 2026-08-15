@@ -7,6 +7,34 @@
 import { describe, it, expect } from 'bun:test';
 import { parseArgs } from 'util';
 import * as git from '@archon/git';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+describe('CLI help output', () => {
+  it('lists the workflow resume command', () => {
+    const result = spawnSync(process.execPath, [join(import.meta.dir, 'cli.ts'), '--help'], {
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      'workflow resume <run-id>   Resume a failed or paused run from completed nodes'
+    );
+  });
+
+  it('documents workflow dry-run flags', () => {
+    const result = spawnSync(process.execPath, [join(import.meta.dir, 'cli.ts'), '--help'], {
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('--dry-run');
+    expect(result.stdout).toContain('--stubs <path>');
+    expect(result.stdout).toContain('--exec-code');
+    expect(result.stdout).toContain('--pause-at-gates');
+  });
+});
 
 // Test the argument parsing logic used in cli.ts
 describe('CLI argument parsing', () => {
@@ -22,12 +50,17 @@ describe('CLI argument parsing', () => {
         branch: { type: 'string', short: 'b' },
         from: { type: 'string' },
         'from-branch': { type: 'string' },
+        base: { type: 'string' },
         'no-worktree': { type: 'boolean' },
         spawn: { type: 'boolean' },
         quiet: { type: 'boolean', short: 'q' },
         verbose: { type: 'boolean', short: 'v' },
         scope: { type: 'string' },
         force: { type: 'boolean' },
+        'dry-run': { type: 'boolean' },
+        stubs: { type: 'string' },
+        'exec-code': { type: 'boolean' },
+        'pause-at-gates': { type: 'boolean' },
       },
       allowPositionals: true,
       strict: false,
@@ -150,6 +183,29 @@ describe('CLI argument parsing', () => {
       ]);
       expect(result.values.from).toBe('feature/primary');
       expect(result.values['from-branch']).toBe('feature/secondary');
+    });
+
+    it('should parse --base flag for workflow run', () => {
+      const result = parseCliArgs(['workflow', 'run', 'assist', '--base', 'epic/foo']);
+      expect(result.values.base).toBe('epic/foo');
+    });
+
+    it('parses workflow dry-run flags', () => {
+      const result = parseCliArgs([
+        'workflow',
+        'run',
+        'assist',
+        '--dry-run',
+        '--stubs',
+        'fixtures.yaml',
+        '--exec-code',
+        '--pause-at-gates',
+      ]);
+
+      expect(result.values['dry-run']).toBe(true);
+      expect(result.values.stubs).toBe('fixtures.yaml');
+      expect(result.values['exec-code']).toBe(true);
+      expect(result.values['pause-at-gates']).toBe(true);
     });
   });
 
@@ -398,9 +454,11 @@ describe('CLI git repo check', () => {
     });
 
     it('should return null for system directories outside any git repo', async () => {
-      // /tmp is typically not inside a git repo
-      // Note: This test may need adjustment if /tmp happens to be inside a repo
-      const result = await git.findRepoRoot('/tmp');
+      // The OS temp dir is not inside a git repo on any supported platform.
+      // Hardcoding '/tmp' fails on Windows, where that path does not exist —
+      // this file was absent from the package test script until #2384, so the
+      // POSIX assumption never surfaced in CI.
+      const result = await git.findRepoRoot(tmpdir());
       expect(result).toBeNull();
     });
   });
@@ -412,7 +470,7 @@ describe('CLI git repo check', () => {
 
     it('should detect existing directories', () => {
       expect(existsSync(process.cwd())).toBe(true);
-      expect(existsSync('/tmp')).toBe(true);
+      expect(existsSync(tmpdir())).toBe(true);
     });
 
     it('should detect non-existent directories', () => {

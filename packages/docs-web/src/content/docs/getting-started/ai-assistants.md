@@ -144,7 +144,7 @@ assistants:
     # claudeBinaryPath: /absolute/path/to/claude
 ```
 
-The `settingSources` option controls which `CLAUDE.md`, skill, command, and agent files the Claude Code SDK loads. The default is `['project', 'user']`, which loads both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. Set it to `['project']` if you want to scope a workflow to project-only resources. Individual workflow nodes can override this with a per-node `settingSources:` field (e.g. `settingSources: []` for a lean node that loads no setting sources at all) — see [Claude SDK Advanced Options](/guides/authoring-workflows/#claude-sdk-advanced-options).
+The `settingSources` option controls where the Claude Code SDK discovers `CLAUDE.md`, skill, command, and agent files. The default is `['project', 'user']`, which includes both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. For workflow skills, discovery is only eligibility: the node's `skills:` list remains the exact active selection, and omission/`[]` activates none. Set `settingSources` to `['project']` to exclude user-level resources, or `[]` for a lean node with no setting sources; a declared skill must live under a source the node enables. See [Claude SDK Advanced Options](/guides/authoring-workflows/#claude-sdk-advanced-options).
 
 ### Set as Default (Optional)
 
@@ -249,7 +249,11 @@ DEFAULT_AI_ASSISTANT=codex
 
 ### Skills
 
-Codex supports skills via filesystem auto-discovery from `.agents/skills/`. Run `archon skill install` (or `archon setup`) to install the bundled `archon` and `manage-run` skills for both Claude Code and Codex.
+Codex supports installed skills from `.agents/skills/`. In workflow nodes Archon
+turns the automatic skill catalog off, so commands and prompts invoke a skill
+explicitly with `$skill-name`. Direct Codex chat keeps native discovery behavior.
+Run `archon skill install` (or `archon setup`) to install the bundled `archon`
+and `manage-run` skills for both Claude Code and Codex.
 
 See [Per-Node Skills](/guides/skills/#codex-compatibility) for behavior details and limitations.
 

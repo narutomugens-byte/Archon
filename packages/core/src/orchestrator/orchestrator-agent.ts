@@ -44,6 +44,8 @@ import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor
 import {
   assertWorkflowRequirementsMet,
   WorkflowRequirementError,
+  assertWorkflowInputsSatisfiable,
+  WorkflowMissingInputsError,
 } from '@archon/workflows/utils/workflow-requirements';
 import type {
   WorkflowDefinition,
@@ -59,6 +61,7 @@ import { deliverCredential } from '../credentials/delivery';
 import { listDecryptedUserProviderCredentials } from '../db/user-provider-key-store';
 import { getUserAiPrefs, type UserAiPrefs } from '../db/user-ai-prefs-store';
 import { createWorkflowDeps } from '../workflows/store-adapter';
+import { createChildWorktreeResolver } from '../workflows/child-isolation-resolver';
 import { loadConfig, loadRepoConfig } from '../config/config-loader';
 import type { MergedConfig } from '../config/config-types';
 import { generateAndSetTitle } from '../services/title-generator';
@@ -610,6 +613,22 @@ interface WorkflowDispatchOptions {
   force?: boolean;
   resumeRunId?: string;
   resumeRun?: WorkflowRun;
+  /**
+   * Keys the engine dropped from the workflow's YAML (#2213). Mirrored into the
+   * conversation before the run starts — chat and the console are where most
+   * runs are STARTED, so a warning that only reaches the CLI misses the moment
+   * of consequence.
+   *
+   * Deliberately unset on every resume path: delivery happens at most ONCE, at
+   * the run's original chat/console start. That is not the same as "the warning
+   * already fired" — delivery lives only in `dispatchOrchestratorWorkflow`, so a
+   * run started by `archon workflow run` (which warns on stderr instead) and
+   * later resumed with `/workflow resume` in chat never produced a chat warning,
+   * and neither did any run predating this feature. Resuming does not re-derive
+   * one; the author's durable surfaces are `validate`, `list` and the console
+   * picker.
+   */
+  parseWarnings?: readonly string[];
 }
 
 const FAILED_RUN_PROMPT_PREVIEW_MAX = 160;
@@ -704,6 +723,39 @@ async function dispatchOrchestratorWorkflow(
   // executeWorkflow dispatch below (repo config worktree.baseBranch still wins).
   const codebaseBaseBranch = codebase.default_branch?.trim() || undefined;
 
+  // Per-child isolation resolver (#2121 slice 2, PR-A): a `workflow:` node with
+  // `isolation: 'worktree'` gets its own worktree per child. Built for git-repo
+  // codebases only — a folder project can't make worktrees, so the engine fails
+  // such a node fast (no resolver injected). Shared across every dispatch below.
+  const resolveChildIsolation =
+    codebase.kind !== 'folder'
+      ? createChildWorktreeResolver({
+          codebaseId: codebase.id,
+          codebaseName: codebase.name,
+          canonicalRepoPath: codebase.default_cwd,
+          baseBranch: codebaseBaseBranch,
+          createdByPlatform: platform.getPlatformType(),
+          createdByUserId: userId,
+        })
+      : undefined;
+
+  // Signature gate (#2470): a workflow declaring `required` inputs is a reusable block —
+  // only a caller's `with:` satisfies them, so a bare top-level invocation fails here,
+  // before any worktree/clone/AI cost. It still lists/loads normally (builder + discovery).
+  try {
+    assertWorkflowInputsSatisfiable(workflow);
+  } catch (err) {
+    if (err instanceof WorkflowMissingInputsError) {
+      getLog().info(
+        { workflowName: workflow.name, missing: err.missing },
+        'workflow.required_inputs_unsatisfiable'
+      );
+      await platform.sendMessage(conversationId, err.message);
+      return;
+    }
+    throw err;
+  }
+
   // Capability gate: hard-fail before any worktree/clone/AI cost if the
   // workflow declares `requires: [github]` and the originating user hasn't
   // connected. No-op when per-user GitHub is disabled (solo PAT installs).
@@ -721,6 +773,26 @@ async function dispatchOrchestratorWorkflow(
         return;
       }
       throw err;
+    }
+  }
+
+  // Keys the engine dropped from this workflow's YAML (#2213). Every chat and
+  // console run funnels through here, so this is the one place that covers all
+  // of them. Sent before the run starts and independently of the run's own
+  // output, so it lands even when the workflow immediately backgrounds itself.
+  // Best-effort: a delivery failure must not stop the run the user asked for.
+  if (options?.parseWarnings && options.parseWarnings.length > 0) {
+    const lines = options.parseWarnings.map(w => `- ${w}`).join('\n');
+    try {
+      await platform.sendMessage(
+        conversationId,
+        `⚠️ \`${workflow.name}\` declares keys the engine ignores:\n${lines}`
+      );
+    } catch (error) {
+      getLog().warn(
+        { err: toError(error), conversationId, workflowName: workflow.name },
+        'workflow.parse_warning_delivery_failed'
+      );
     }
   }
 
@@ -867,7 +939,9 @@ async function dispatchOrchestratorWorkflow(
           parentConversationId: conversation.id,
           userId,
           source,
+          parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
+          resolveChildIsolation,
           ...prepared,
         }
       );
@@ -889,7 +963,9 @@ async function dispatchOrchestratorWorkflow(
           parentConversationId: conversation.id,
           userId,
           source,
+          parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
+          resolveChildIsolation,
         }
       );
     }
@@ -907,6 +983,7 @@ async function dispatchOrchestratorWorkflow(
         isolationHints,
         userId,
         source,
+        parseWarnings: options?.parseWarnings,
       },
       workflow
     );
@@ -925,7 +1002,9 @@ async function dispatchOrchestratorWorkflow(
         parentConversationId: conversation.id,
         userId,
         source,
+        parseWarnings: options?.parseWarnings,
         baseBranch: codebaseBaseBranch,
+        resolveChildIsolation,
       }
     );
   }
@@ -1332,6 +1411,7 @@ export async function handleMessage(
               force: result.workflow.force,
               resumeRunId: result.workflow.resumeRunId,
               resumeRun: result.workflow.resumeRun,
+              parseWarnings: result.workflow.parseWarnings,
             }
           );
         }
@@ -1716,7 +1796,7 @@ export async function handleMessage(
         conversationId,
         message,
         codebases,
-        workflows,
+        workflowsWithSource,
         aiClient,
         fullPrompt,
         cwd,
@@ -1733,7 +1813,7 @@ export async function handleMessage(
         conversationId,
         message,
         codebases,
-        workflows,
+        workflowsWithSource,
         aiClient,
         fullPrompt,
         cwd,
@@ -1786,7 +1866,7 @@ async function handleStreamMode(
   conversationId: string,
   originalMessage: string,
   codebases: readonly Codebase[],
-  workflows: readonly WorkflowDefinition[],
+  workflows: readonly WorkflowWithSource[],
   aiClient: ReturnType<typeof getAgentProvider>,
   fullPrompt: string,
   cwd: string,
@@ -1934,7 +2014,11 @@ async function handleStreamMode(
   }
 
   const fullResponse = allMessages.join('');
-  const commands = parseOrchestratorCommands(fullResponse, codebases, workflows);
+  const commands = parseOrchestratorCommands(
+    fullResponse,
+    codebases,
+    workflows.map(ws => ws.workflow)
+  );
 
   if (commands.workflowInvocation) {
     // Retract streamed text — workflow dispatch replaces it
@@ -2012,7 +2096,7 @@ async function handleBatchMode(
   conversationId: string,
   originalMessage: string,
   codebases: readonly Codebase[],
-  workflows: readonly WorkflowDefinition[],
+  workflows: readonly WorkflowWithSource[],
   aiClient: ReturnType<typeof getAgentProvider>,
   fullPrompt: string,
   cwd: string,
@@ -2192,7 +2276,11 @@ async function handleBatchMode(
   // separator lines that break multi-chunk command text (name and path appear on
   // separate lines from '/register-project'). Raw join preserves the command as a
   // contiguous string. User-visible output still comes from filterToolIndicators.
-  const commands = parseOrchestratorCommands(assistantMessages.join(''), codebases, workflows);
+  const commands = parseOrchestratorCommands(
+    assistantMessages.join(''),
+    codebases,
+    workflows.map(ws => ws.workflow)
+  );
 
   if (commands.workflowInvocation) {
     if (platform.emitRetract) {
@@ -2289,7 +2377,7 @@ async function handleWorkflowInvocationResult(
   conversationId: string,
   conversation: Conversation,
   codebases: readonly Codebase[],
-  workflows: readonly WorkflowDefinition[],
+  workflows: readonly WorkflowWithSource[],
   invocation: WorkflowInvocation,
   originalMessage: string,
   isolationHints: HandleMessageContext['isolationHints'],
@@ -2305,7 +2393,13 @@ async function handleWorkflowInvocationResult(
 
   // Find the codebase and workflow (supports partial name matching)
   const codebase = findCodebaseByName(codebases, projectName);
-  const workflow = findWorkflow(workflowName, [...workflows]);
+  // Keep the discovery ENTRY, not just the definition: it carries the parse
+  // warnings this path used to discard (#2213).
+  const workflowEntry = workflows.find(ws => ws.workflow.name === workflowName);
+  const workflow = findWorkflow(
+    workflowName,
+    workflows.map(ws => ws.workflow)
+  );
 
   if (codebase && workflow) {
     const workflowPrompt = invocation.synthesizedPrompt ?? originalMessage;
@@ -2327,7 +2421,9 @@ async function handleWorkflowInvocationResult(
       workflow,
       workflowPrompt,
       isolationHints,
-      userId
+      userId,
+      workflowEntry?.source,
+      { parseWarnings: workflowEntry?.parseWarnings }
     );
     return;
   }
@@ -2755,7 +2851,12 @@ async function handleWorkflowRunCommand(
       isolationHints,
       userId,
       resolvedEntry?.source,
-      options
+      // Warnings must describe the workflow that will EXECUTE. This branch
+      // RE-RESOLVES the workflow against the single project's discovery, which
+      // can land on a different file than the caller resolved (a project
+      // workflow shadowing a same-named global one). Inheriting the caller's
+      // warnings would then describe a workflow that is not running.
+      { ...options, parseWarnings: resolvedEntry?.parseWarnings }
     );
     return;
   }

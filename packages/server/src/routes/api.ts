@@ -9,7 +9,7 @@ import type { WebAdapter } from '../adapters/web';
 import { boundMetadataToolOutputs } from '../adapters/web/truncate';
 import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
-import { normalize, join, sep, basename } from 'path';
+import { normalize, join, sep, basename, dirname, resolve } from 'path';
 import { randomUUID } from 'crypto';
 import type { Context } from 'hono';
 import type {
@@ -19,10 +19,12 @@ import type {
   GlobalConfig,
   TiersPatch,
   UserRole,
+  SchemaVersionInfo,
 } from '@archon/core';
 import {
   handleMessage,
   getDatabaseType,
+  getSchemaVersion,
   loadConfig,
   loadRepoConfig,
   toSafeConfig,
@@ -70,7 +72,10 @@ import {
   getArchonWorkspacesPath,
   getHomeCommandsPath,
   getHomeWorkflowsPath,
-  getRunArtifactsPath,
+  resolveProjectStorageKey,
+  getRunArtifactsDirForKey,
+  getRunArtifactsDirForRoot,
+  isInsideArchonHome,
   getArchonHome,
   isDocker,
   isWSL,
@@ -78,9 +83,11 @@ import {
   checkForUpdate,
   BUNDLED_IS_BINARY,
   BUNDLED_VERSION,
-  parseOwnerRepo,
 } from '@archon/paths';
-import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import {
+  discoverWorkflowsWithConfig,
+  isValidWorkflowFolderSegment,
+} from '@archon/workflows/workflow-discovery';
 import { parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName, isValidWorkflowName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -100,6 +107,151 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('api');
   return cachedLog;
+}
+
+interface RawWorkflowFile {
+  absolutePath: string;
+  filename: string;
+  packaged: boolean;
+  parsed: ReturnType<typeof parseWorkflow>;
+}
+
+async function tryReadWorkflowAt(dir: string, name: string): Promise<RawWorkflowFile | null> {
+  const acceptedNames = new Set(name.includes('/') ? [name, basename(name)] : [name]);
+  for (const ext of ['yaml', 'yml']) {
+    const filename = `${name}.${ext}`;
+    const absolutePath = join(dir, filename);
+    try {
+      const content = await readFile(absolutePath, 'utf-8');
+      const parsed = parseWorkflow(content, filename);
+      if (parsed.workflow !== null && !acceptedNames.has(parsed.workflow.name)) continue;
+      return { absolutePath, filename, packaged: false, parsed };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  return null;
+}
+
+async function findPackagedWorkflowAt(
+  workflowsRoot: string,
+  name: string
+): Promise<RawWorkflowFile | null> {
+  let packs: string[];
+  try {
+    packs = await readdir(workflowsRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+
+  let match: RawWorkflowFile | null = null;
+  for (const pack of packs.sort((a, b) => a.localeCompare(b))) {
+    if (!isValidWorkflowFolderSegment(pack)) continue;
+    const packPath = join(workflowsRoot, pack);
+    try {
+      if (!(await stat(packPath)).isDirectory()) continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+
+    let workflowFolders: string[];
+    try {
+      workflowFolders = await readdir(packPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const workflowFolder of workflowFolders.sort((a, b) => a.localeCompare(b))) {
+      if (!isValidWorkflowFolderSegment(workflowFolder)) continue;
+      const workflowPath = join(packPath, workflowFolder);
+      try {
+        if (!(await stat(workflowPath)).isDirectory()) continue;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+
+      let workflowEntries: string[];
+      try {
+        workflowEntries = await readdir(workflowPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      const yamlFiles = workflowEntries
+        .filter(entry => entry.endsWith('.yaml') || entry.endsWith('.yml'))
+        .sort((a, b) => a.localeCompare(b));
+      if (yamlFiles.length !== 1) continue;
+
+      const yamlFilename = yamlFiles[0];
+      const absolutePath = join(workflowPath, yamlFilename);
+      let content: string;
+      try {
+        content = await readFile(absolutePath, 'utf-8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      const parsed = parseWorkflow(content, yamlFilename);
+      const yamlStem = yamlFilename.replace(/\.ya?ml$/, '');
+      const isMalformedTarget =
+        parsed.workflow === null && (yamlStem === name || workflowFolder === name);
+      if (parsed.workflow?.name !== name && !isMalformedTarget) continue;
+      if (match !== null) {
+        throw new Error(`Multiple packaged workflows declare the name '${name}'`);
+      }
+      match = {
+        absolutePath,
+        filename: `${pack}/${workflowFolder}/${yamlFilename}`,
+        packaged: true,
+        parsed,
+      };
+    }
+  }
+  return match;
+}
+
+async function findWorkflowAt(
+  workflowsRoot: string,
+  name: string
+): Promise<RawWorkflowFile | null> {
+  return (
+    (await tryReadWorkflowAt(workflowsRoot, name)) ??
+    (await findPackagedWorkflowAt(workflowsRoot, name))
+  );
+}
+
+function isBundledWorkflowsRoot(workflowsRoot: string): boolean {
+  return resolve(workflowsRoot) === resolve(dirname(getDefaultWorkflowsPath()));
+}
+
+function findBundledWorkflow(
+  name: string
+): { filename: string; parsed: ReturnType<typeof parseWorkflow> } | null {
+  const direct = BUNDLED_WORKFLOWS[name];
+  if (direct !== undefined) {
+    const filename = `${name}.yaml`;
+    const parsed = parseWorkflow(direct, filename);
+    if (parsed.error !== null || parsed.workflow?.name === name) {
+      return { filename, parsed };
+    }
+  }
+
+  let match: {
+    filename: string;
+    parsed: ReturnType<typeof parseWorkflow>;
+  } | null = null;
+  for (const [filenameStem, content] of Object.entries(BUNDLED_WORKFLOWS)) {
+    if (filenameStem === name) continue;
+    const filename = `${filenameStem}.yaml`;
+    const parsed = parseWorkflow(content, filename);
+    if (parsed.workflow?.name !== name) continue;
+    if (match !== null) throw new Error(`Multiple bundled workflows declare the name '${name}'`);
+    match = { filename, parsed };
+  }
+  return match;
 }
 import * as conversationDb from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
@@ -239,6 +391,47 @@ if (BUNDLED_IS_BINARY) {
 }
 
 type WorkflowSource = 'project' | 'bundled' | 'global';
+
+/**
+ * Resolve the on-disk artifact directory for a run, for EVERY project kind
+ * (#2200).
+ *
+ * Both artifact routes previously did `parseOwnerRepo(codebase.name)` alone,
+ * which returns null for a folder project (display name, no slash) and for a
+ * no-remote local repo (bare basename) — so artifact browsing was silently dead
+ * for two of the three project kinds Archon can register.
+ *
+ * Order mirrors the executor: a persisted `output_root` wins outright (a
+ * codebase renamed since the run must not orphan its artifacts, #1192);
+ * otherwise the shared `resolveProjectStorageKey` derives the key. Returns null
+ * only when there is no codebase row to derive from at all — callers surface
+ * that as an explicit 404 rather than an empty success.
+ *
+ * The `cwd` argument is `codebase.default_cwd` here, while the executor passes
+ * the RUN's cwd (which inside a worktree is the worktree path). That only
+ * differs for the `{ kind: 'cwd' }` fallback, and every run since #2200
+ * persists `output_root`, so this path never re-derives for a modern run.
+ */
+function resolveRunArtifactDir(
+  run: { output_root?: string | null },
+  codebase: { kind?: string | null; name: string; default_cwd: string } | null,
+  runId: string
+): string | null {
+  // The containment check belongs INSIDE this branch, not after it. A persisted
+  // root is a cache of where the run wrote, not an authority: move ARCHON_HOME
+  // (machine migration, restored backup, the documented ARCHON_DATA split) and
+  // every stamped root is suddenly out-of-tree. Guarding after the fact would
+  // hard-400 every historical run even when its artifacts sit re-derivable and
+  // physically present under the new home — and `output_root` is write-once via
+  // COALESCE, so the app could never clear the column to recover. Falling
+  // through to re-derivation keeps the tree relocatable, which is how it behaved
+  // before the column existed. Matches `continue.ts`.
+  if (run.output_root && isInsideArchonHome(run.output_root)) {
+    return getRunArtifactsDirForRoot(run.output_root, runId);
+  }
+  if (!codebase?.name) return null;
+  return getRunArtifactsDirForKey(resolveProjectStorageKey(codebase, codebase.default_cwd), runId);
+}
 
 // =========================================================================
 // OpenAPI route configs (module-scope — pure config, no runtime dependencies)
@@ -673,8 +866,12 @@ const listRunArtifactsRoute = createRoute({
   summary: "List a run's artifact files",
   description:
     "Walks the run's artifact directory and returns relative file paths with size + " +
-    'mtime. Drives the console Artifacts tab. Returns `{ files: [] }` when the run ' +
-    'has no codebase or the codebase name is not in `owner/repo` form.',
+    'mtime. Drives the console Artifacts tab. Resolves for every project kind — ' +
+    "`owner/repo`, `_local/<basename>`, and `_folder/<slug>` — preferring the run's " +
+    'persisted `output_root` and re-deriving from the codebase when it is absent or ' +
+    'no longer inside ARCHON_HOME. Returns `{ files: [] }` only when the location ' +
+    'resolved and the run genuinely wrote nothing; returns 404 when the output ' +
+    'location cannot be resolved at all.',
   request: {
     params: z.object({ runId: z.string() }),
   },
@@ -1298,6 +1495,16 @@ const getHealthRoute = createRoute({
               is_wsl: z.boolean(),
               wsl_distro: z.string().optional(),
               activePlatforms: z.array(z.string()).optional(),
+              // Schema vintage (#2316) so a bug report can state which Archon build
+              // created this database and which last applied schema to it. Omitted
+              // when unrecorded or unreadable — health must answer regardless.
+              schema: z
+                .object({
+                  createdAppVersion: z.string().nullable(),
+                  appVersion: z.string(),
+                  appliedAt: z.string().nullable(),
+                })
+                .optional(),
             })
             .openapi('HealthResponse'),
         },
@@ -2954,7 +3161,15 @@ export function registerApiRoutes(
       }
 
       return c.json({
-        workflows: result.workflows.map(ws => ({ workflow: ws.workflow, source: ws.source })),
+        workflows: result.workflows.map(ws => ({
+          workflow: ws.workflow,
+          source: ws.source,
+          // Keys the engine dropped from this YAML (#2213) — the console is the
+          // surface most authors edit workflows on, so it has to carry them.
+          ...(ws.parseWarnings && ws.parseWarnings.length > 0
+            ? { parseWarnings: [...ws.parseWarnings] }
+            : {}),
+        })),
         recommended,
         errors: result.errors.length > 0 ? result.errors : undefined,
       });
@@ -3615,24 +3830,6 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid workflow name');
     }
 
-    // Try `.yaml` then `.yml`, mirroring `loadWorkflowsFromDir` in
-    // workflow-discovery.ts so by-name lookup matches the list endpoint.
-    // Returns null if neither extension exists (caller tries the next source).
-    const tryReadWorkflowAt = async (
-      dir: string
-    ): Promise<{ filename: string; content: string } | null> => {
-      for (const ext of ['yaml', 'yml']) {
-        const filename = `${name}.${ext}`;
-        try {
-          const content = await readFile(join(dir, filename), 'utf-8');
-          return { filename, content };
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-        }
-      }
-      return null;
-    };
-
     try {
       const cwd = c.req.query('cwd');
       let workingDir = cwd;
@@ -3648,10 +3845,13 @@ export function registerApiRoutes(
       // 1. Try user-defined workflow in cwd.
       if (workingDir) {
         const [workflowFolder] = getWorkflowFolderSearchPaths();
+        const projectWorkflowsRoot = join(workingDir, workflowFolder);
         try {
-          const hit = await tryReadWorkflowAt(join(workingDir, workflowFolder));
-          if (hit) {
-            const result = parseWorkflow(hit.content, hit.filename);
+          const hit = await findWorkflowAt(projectWorkflowsRoot, name);
+          const isSourceBundledPackage =
+            hit?.packaged === true && isBundledWorkflowsRoot(projectWorkflowsRoot);
+          if (hit && !isSourceBundledPackage) {
+            const result = hit.parsed;
             if (result.error) {
               return apiError(c, 500, `Workflow file is invalid: ${result.error.error}`);
             }
@@ -3670,9 +3870,9 @@ export function registerApiRoutes(
       // 2. Fall back to home-scoped workflow (`~/.archon/workflows/`).
       // Mirrors the discovery order in `discoverWorkflowsWithConfig`.
       try {
-        const hit = await tryReadWorkflowAt(getHomeWorkflowsPath());
+        const hit = await findWorkflowAt(getHomeWorkflowsPath(), name);
         if (hit) {
-          const result = parseWorkflow(hit.content, hit.filename);
+          const result = hit.parsed;
           if (result.error) {
             return apiError(c, 500, `Home workflow file is invalid: ${result.error.error}`);
           }
@@ -3688,25 +3888,26 @@ export function registerApiRoutes(
       }
 
       // 3. Fall back to bundled defaults.
-      if (Object.hasOwn(BUNDLED_WORKFLOWS, name)) {
-        const bundledFilename = `${name}.yaml`;
-        const bundledContent = BUNDLED_WORKFLOWS[name];
-        const result = parseWorkflow(bundledContent, bundledFilename);
+      const bundled = findBundledWorkflow(name);
+      if (bundled !== null) {
+        const result = bundled.parsed;
         if (result.error) {
           return apiError(c, 500, `Bundled workflow is invalid: ${result.error.error}`);
         }
         return c.json({
           workflow: result.workflow,
-          filename: bundledFilename,
+          filename: bundled.filename,
           source: 'bundled' as WorkflowSource,
         });
       }
 
       if (!isBinaryBuild()) {
         try {
-          const hit = await tryReadWorkflowAt(getDefaultWorkflowsPath());
+          const hit =
+            (await tryReadWorkflowAt(getDefaultWorkflowsPath(), name)) ??
+            (await findPackagedWorkflowAt(dirname(getDefaultWorkflowsPath()), name));
           if (hit) {
-            const result = parseWorkflow(hit.content, hit.filename);
+            const result = hit.parsed;
             if (result.error) {
               return apiError(c, 500, `Default workflow is invalid: ${result.error.error}`);
             }
@@ -3782,11 +3983,16 @@ export function registerApiRoutes(
           ? getHomeWorkflowsPath()
           : join(workingDir, getWorkflowFolderSearchPaths()[0]);
       await mkdir(dirPath, { recursive: true });
-      const filePath = join(dirPath, `${name}.yaml`);
+      const existing = await findWorkflowAt(dirPath, name);
+      if (existing?.packaged === true && isBundledWorkflowsRoot(dirPath)) {
+        return apiError(c, 400, `Cannot overwrite bundled default workflow: ${name}`);
+      }
+      const filePath = existing?.absolutePath ?? join(dirPath, `${name}.yaml`);
+      const filename = existing?.filename ?? `${name}.yaml`;
       await writeFile(filePath, yamlContent, 'utf-8');
       return c.json({
         workflow: parsed.workflow,
-        filename: `${name}.yaml`,
+        filename,
         source,
       });
     } catch (error) {
@@ -3806,11 +4012,6 @@ export function registerApiRoutes(
     const targetSource = c.req.query('source');
     if (targetSource && targetSource !== 'project' && targetSource !== 'global') {
       return apiError(c, 400, 'Invalid workflow source');
-    }
-
-    // Refuse to delete bundled defaults
-    if (targetSource !== 'global' && Object.hasOwn(BUNDLED_WORKFLOWS, name)) {
-      return apiError(c, 400, `Cannot delete bundled default workflow: ${name}`);
     }
 
     const cwd = c.req.query('cwd');
@@ -3834,6 +4035,20 @@ export function registerApiRoutes(
         ? getHomeWorkflowsPath()
         : join(workingDir, getWorkflowFolderSearchPaths()[0]);
 
+    try {
+      const packaged = await findPackagedWorkflowAt(dir, name);
+      if (packaged !== null) {
+        if (isBundledWorkflowsRoot(dir)) {
+          return apiError(c, 400, `Cannot delete bundled default workflow: ${name}`);
+        }
+        await rm(dirname(packaged.absolutePath), { recursive: true });
+        return c.json({ deleted: true, name });
+      }
+    } catch (err) {
+      getLog().error({ err, name }, 'workflow.delete_failed');
+      return apiError(c, 500, 'Failed to delete workflow');
+    }
+
     // Remove both `.yaml` and `.yml` variants (discovery accepts either), so a
     // twin file can't stay active after a reported deletion.
     let deleted = false;
@@ -3850,6 +4065,16 @@ export function registerApiRoutes(
     }
     if (deleted) {
       return c.json({ deleted: true, name });
+    }
+    if (targetSource !== 'global') {
+      try {
+        if (findBundledWorkflow(name) !== null) {
+          return apiError(c, 400, `Cannot delete bundled default workflow: ${name}`);
+        }
+      } catch (err) {
+        getLog().error({ err, name }, 'workflow.delete_failed');
+        return apiError(c, 500, 'Failed to delete workflow');
+      }
     }
     return apiError(c, 404, `Workflow not found: ${name}`);
   });
@@ -3973,22 +4198,22 @@ export function registerApiRoutes(
         return apiError(c, 500, 'Failed to look up codebase');
       }
     }
-    if (!codebase?.name) return c.json({ files: [] });
-    const parsed = parseOwnerRepo(codebase.name);
-    if (!parsed) return c.json({ files: [] });
-    const { owner, repo } = parsed;
-
-    const artifactDir = getRunArtifactsPath(owner, repo, runId);
-    // Defense-in-depth: even though registration sanitises codebase names,
-    // ensure the resolved dir stays inside ARCHON_HOME — a maliciously
-    // crafted owner/repo containing `..` would otherwise escape the tree.
-    const archonHome = getArchonHome();
-    const normalisedDir = normalize(artifactDir);
-    if (
-      !normalisedDir.startsWith(normalize(archonHome) + sep) &&
-      normalisedDir !== normalize(archonHome)
-    ) {
-      getLog().warn({ runId, artifactDir, archonHome }, 'artifacts.path_escape_blocked');
+    // An empty 200 here is indistinguishable from "the run produced nothing",
+    // so an unresolvable output location is an explicit 404 (Fail Fast).
+    const artifactDir = resolveRunArtifactDir(run, codebase, runId);
+    if (!artifactDir) {
+      getLog().warn({ runId, codebaseId: run.codebase_id }, 'artifacts.output_location_unresolved');
+      return apiError(
+        c,
+        404,
+        'Artifacts not available: could not resolve this run’s output location'
+      );
+    }
+    if (!isInsideArchonHome(artifactDir)) {
+      getLog().warn(
+        { runId, artifactDir, archonHome: getArchonHome() },
+        'artifacts.path_escape_blocked'
+      );
       return apiError(c, 400, 'Invalid artifact path');
     }
 
@@ -4091,20 +4316,28 @@ export function registerApiRoutes(
       return apiError(c, 404, 'Workflow run not found');
     }
 
-    // Derive owner/repo from codebase name (format: "owner/repo")
+    // Resolve the run's output tree for every project kind — a persisted
+    // output_root first, else the shared identity→paths resolver (#2200).
     const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
-    if (!codebase?.name) {
-      getLog().error({ runId, codebaseId: run.codebase_id }, 'artifacts.codebase_lookup_failed');
-      return apiError(c, 404, 'Artifact not available: codebase not found');
+    const artifactDir = resolveRunArtifactDir(run, codebase, runId);
+    if (!artifactDir) {
+      getLog().error(
+        { runId, codebaseId: run.codebase_id },
+        'artifacts.output_location_unresolved'
+      );
+      return apiError(
+        c,
+        404,
+        'Artifact not available: could not resolve this run’s output location'
+      );
     }
-    const parsed = parseOwnerRepo(codebase.name);
-    if (!parsed) {
-      getLog().error({ runId, codebaseName: codebase.name }, 'artifacts.owner_repo_parse_failed');
-      return apiError(c, 404, 'Artifact not available: could not determine owner/repo');
+    if (!isInsideArchonHome(artifactDir)) {
+      getLog().warn(
+        { runId, artifactDir, archonHome: getArchonHome() },
+        'artifacts.path_escape_blocked'
+      );
+      return apiError(c, 400, 'Invalid artifact path');
     }
-    const { owner, repo } = parsed;
-
-    const artifactDir = getRunArtifactsPath(owner, repo, runId);
     const filePath = join(artifactDir, filename);
 
     // Final safety check: ensure resolved path stays within artifact directory
@@ -4320,6 +4553,26 @@ export function registerApiRoutes(
     const allActiveIds = [...stats.activeConversationIds, ...backgroundConversationIds];
     const wslDistro = getWSLDistroName();
 
+    // Health is public (PUBLIC_API_GATE_PREFIXES) and must stay answerable when the
+    // database is degraded, so a failed vintage read is logged and the key omitted
+    // rather than turning the healthcheck into a 500. `createdAt` is deliberately not
+    // exposed — the two version strings plus applied_at are what a bug report needs.
+    let schema:
+      | Pick<SchemaVersionInfo, 'createdAppVersion' | 'appVersion' | 'appliedAt'>
+      | undefined;
+    try {
+      const info = await getSchemaVersion();
+      if (info) {
+        schema = {
+          createdAppVersion: info.createdAppVersion,
+          appVersion: info.appVersion,
+          appliedAt: info.appliedAt,
+        };
+      }
+    } catch (err) {
+      getLog().warn({ err }, 'api.schema_version_read_failed');
+    }
+
     return c.json({
       status: 'ok',
       adapter: 'web',
@@ -4334,6 +4587,7 @@ export function registerApiRoutes(
       is_wsl: isWSL(),
       ...(wslDistro ? { wsl_distro: wslDistro } : {}),
       activePlatforms: activePlatforms ? [...activePlatforms] : ['Web'],
+      ...(schema ? { schema } : {}),
     });
   });
 

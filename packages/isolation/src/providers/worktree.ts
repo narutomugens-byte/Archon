@@ -710,10 +710,12 @@ export class WorktreeProvider implements IIsolationProvider {
     // Resolve git remote name: explicit config > auto-detect > actionable error
     const remote = await this.resolveRemote(repoPath, worktreeConfig?.remote);
 
-    // Sync uses explicit repo config first, then the registered codebase's
-    // default branch (request.baseBranch), then auto-detects via getDefaultBranch.
+    // Base precedence: a per-dispatch --base override (request.baseOverride) wins,
+    // then explicit repo config, then the registered codebase's default branch
+    // (request.baseBranch), then auto-detect via getDefaultBranch.
     // request.fromBranch is the start-point for worktree creation, not a sync target.
-    const preferredBaseBranch = worktreeConfig?.baseBranch ?? request.baseBranch;
+    const preferredBaseBranch =
+      request.baseOverride ?? worktreeConfig?.baseBranch ?? request.baseBranch;
     const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, preferredBaseBranch, remote);
 
     const override: WorktreeBaseOverride = {
@@ -811,15 +813,26 @@ export class WorktreeProvider implements IIsolationProvider {
       return detected;
     }
 
-    // Ambiguous (multiple non-origin remotes) — list them for an actionable error
-    let remoteList = '<unknown>';
+    // Distinguish no remotes from multiple non-origin remotes for an actionable error.
+    let remoteNames: string[] | null = null;
     try {
       const { stdout } = await execFileAsync('git', ['-C', repoPath, 'remote'], { timeout: 10000 });
-      remoteList = stdout.trim().split(/\r?\n/).join(', ');
+      remoteNames = stdout
+        .split(/\r?\n/)
+        .map(remote => remote.trim())
+        .filter(remote => remote.length > 0);
     } catch {
       // Best-effort for error message only
     }
 
+    if (remoteNames?.length === 0) {
+      throw new Error(
+        `Cannot determine git remote for ${repoPath}: no git remote is configured. ` +
+          'Add one with `git remote add origin URL`, or use `--no-worktree` to run in the live checkout.'
+      );
+    }
+
+    const remoteList = remoteNames?.join(', ') ?? '<unknown>';
     throw new Error(
       `Cannot determine git remote for ${repoPath}: no 'origin' remote found and ` +
         `multiple remotes exist (${remoteList}). ` +

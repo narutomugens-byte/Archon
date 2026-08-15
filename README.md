@@ -161,6 +161,11 @@ Already have Claude Code set up? Install the standalone CLI binary and skip the 
 curl -fsSL https://archon.diy/install | bash
 ```
 
+> **x64 compatibility:** The macOS/Linux quick install requires AVX2 on x64
+> CPUs. Older Intel/AMD hardware and virtual machines that mask AVX2 should use
+> the [source installation guide](https://archon.diy/getting-started/installation/#from-source).
+> ARM64 quick installs are unaffected.
+
 **Windows (PowerShell)**
 ```powershell
 irm https://archon.diy/install.ps1 | iex
@@ -252,7 +257,7 @@ Archon ships with workflows for common development tasks:
 
 Archon ships 19 default workflows - run `archon workflow list` or describe what you want and the router picks the right one.
 
-**Or define your own.** Default workflows are great starting points - copy one from `.archon/workflows/defaults/` and customize it. Workflows are YAML files in `.archon/workflows/`, commands are markdown files in `.archon/commands/`. Same-named files in your repo override the bundled defaults. Commit them - your whole team runs the same process.
+**Or define your own.** Keep a workflow copyable by placing its YAML, commands, and scripts together under `.archon/workflows/<pack>/<workflow>/`; both directory names are yours. The same tree works in target repos and under `~/.archon/workflows/`. Existing flat workflows and shared `.archon/commands/` / `.archon/scripts/` remain supported. Same-named workflow files in your repo override bundled defaults.
 
 See [Authoring Workflows](https://archon.diy/guides/authoring-workflows/) and [Authoring Commands](https://archon.diy/guides/authoring-commands/).
 

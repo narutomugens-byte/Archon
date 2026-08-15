@@ -2384,6 +2384,25 @@ describe('WorktreeProvider', () => {
       });
     });
 
+    test('uses request baseOverride over configured baseBranch and request baseBranch', async () => {
+      worktreeExistsSpy.mockResolvedValue(false);
+      const configLoader: RepoConfigLoader = async () => ({ baseBranch: 'main' });
+      provider = new WorktreeProvider(configLoader);
+
+      await provider.create({
+        ...baseRequest,
+        baseBranch: git.toBranchName('develop'),
+        baseOverride: git.toBranchName('epic/foo'),
+      });
+
+      // --base (baseOverride) is the top precedence level: it beats repo-config
+      // 'main' and the codebase-default request.baseBranch 'develop'.
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith('/workspace/owner/repo', 'epic/foo', {
+        mode: 'fast-forward',
+        remote: 'origin',
+      });
+    });
+
     test('uses explicit reset mode for managed clone worktree creation', async () => {
       worktreeExistsSpy.mockResolvedValue(false);
       const configLoader: RepoConfigLoader = async () => ({});
@@ -3135,6 +3154,19 @@ describe('WorktreeProvider', () => {
         /Cannot determine git remote.*jan, feb, mar.*Set worktree\.remote/s
       );
       // No sync attempted from an unknown remote
+      expect(syncWorkspaceSpy).not.toHaveBeenCalled();
+    });
+
+    test('throws actionable error when no remote is configured', async () => {
+      getDefaultRemoteSpy.mockResolvedValue(null);
+
+      const localProvider = new WorktreeProvider(async () => ({ baseBranch: 'main' }));
+      const creation = localProvider.create(baseRequest);
+
+      await expect(creation).rejects.toThrow(
+        /no git remote is configured.*git remote add origin URL.*--no-worktree/s
+      );
+      await expect(creation).rejects.not.toThrow(/multiple remotes|worktree\.remote/s);
       expect(syncWorkspaceSpy).not.toHaveBeenCalled();
     });
 

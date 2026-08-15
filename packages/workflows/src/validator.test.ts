@@ -17,6 +17,7 @@ import {
   discoverAvailableCommands,
 } from './validator';
 import type { WorkflowDefinition, DagNode } from './schemas';
+import { formatPackagedResourceReference } from './packaged-workflow';
 
 // =============================================================================
 // Test helpers
@@ -175,6 +176,69 @@ describe('validateWorkflowResources — command nodes', () => {
     const errors = issues.filter(i => i.level === 'error');
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toContain('Invalid command name');
+  });
+
+  test('validates a command inside its owning packaged workflow', async () => {
+    const commandsDir = join(tmpDir, '.archon', 'workflows', 'team-pack', 'release', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'prepare.md'), '# Prepare');
+    const command = formatPackagedResourceReference(
+      { source: 'project', pack: 'team-pack', workflow: 'release' },
+      'prepare'
+    );
+    const workflow = makeWorkflow('test', [{ id: 'step1', command } as DagNode]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(issues.filter(issue => issue.level === 'error')).toHaveLength(0);
+  });
+
+  test('rejects a directory masquerading as a packaged command file', async () => {
+    const commandsDir = join(tmpDir, '.archon', 'workflows', 'team-pack', 'release', 'commands');
+    await mkdir(join(commandsDir, 'prepare.md'), { recursive: true });
+    const command = formatPackagedResourceReference(
+      { source: 'project', pack: 'team-pack', workflow: 'release' },
+      'prepare'
+    );
+    const workflow = makeWorkflow('test', [{ id: 'step1', command } as DagNode]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(issues.some(issue => issue.level === 'error' && issue.field === 'command')).toBe(true);
+  });
+});
+
+// =============================================================================
+// validateWorkflowResources — bundled sub-run target check (#2470)
+// =============================================================================
+
+describe('validateWorkflowResources — bundled workflow: target check', () => {
+  test('bundled workflow with a real bundled workflow: target passes', async () => {
+    const workflow = makeWorkflow('test', [{ id: 'sub', workflow: 'archon-assist' } as DagNode]);
+    const issues = await validateWorkflowResources(workflow, tmpDir, {
+      workflowSource: 'bundled',
+    });
+    expect(issues.some(i => i.field === 'workflow')).toBe(false);
+  });
+
+  test('bundled workflow with a workflow: node to a non-existent bundled name fails', async () => {
+    const workflow = makeWorkflow('test', [
+      { id: 'sub', workflow: 'definitely-not-a-bundled-workflow' } as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir, {
+      workflowSource: 'bundled',
+    });
+    expect(
+      issues.some(i => i.field === 'workflow' && i.message.includes('not a bundled workflow'))
+    ).toBe(true);
+  });
+
+  test('project workflow with a workflow: node to a non-existent name is NOT checked (runtime-resolved)', async () => {
+    const workflow = makeWorkflow('test', [
+      { id: 'sub', workflow: 'definitely-not-a-bundled-workflow' } as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir, {
+      workflowSource: 'project',
+    });
+    expect(issues.some(i => i.field === 'workflow')).toBe(false);
   });
 });
 
@@ -625,6 +689,24 @@ describe('validateWorkflowResources — script nodes', () => {
     const scriptErrors = issues.filter(i => i.level === 'error' && i.field === 'script');
     expect(scriptErrors).toHaveLength(0);
   });
+
+  test('validates a named script inside its owning packaged workflow', async () => {
+    const scriptsDir = join(tmpDir, '.archon', 'workflows', 'team-pack', 'release', 'scripts');
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(join(scriptsDir, 'publish.ts'), 'console.log("publish")');
+    const script = formatPackagedResourceReference(
+      { source: 'project', pack: 'team-pack', workflow: 'release' },
+      'publish'
+    );
+    const workflow = makeWorkflow('test', [
+      { id: 'step1', script, runtime: 'bun' } as unknown as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(
+      issues.filter(issue => issue.level === 'error' && issue.field === 'script')
+    ).toHaveLength(0);
+  });
 });
 
 // =============================================================================
@@ -912,50 +994,206 @@ describe('validateWorkflowResources — skills search roots', () => {
     );
   }
 
-  function missingSkillWarnings(issues: Awaited<ReturnType<typeof validateWorkflowResources>>) {
-    return issues.filter(
-      i => i.level === 'warning' && i.field === 'skills' && i.message.includes('not found')
-    );
+  function missingSkillIssues(issues: Awaited<ReturnType<typeof validateWorkflowResources>>) {
+    return issues.filter(i => i.field === 'skills' && i.message.includes('not found'));
   }
 
-  test('no warning for a skill under <cwd>/.agents/skills/', async () => {
+  test('Claude rejects a skill installed only under <cwd>/.agents/skills/', async () => {
     await stageSkill(tmpDir, '.agents', 'my-skill');
     const issues = await validateWorkflowResources(skillsWorkflow('my-skill'), tmpDir);
-    expect(missingSkillWarnings(issues)).toHaveLength(0);
+    const missing = missingSkillIssues(issues);
+    expect(missing).toHaveLength(1);
+    expect(missing[0].level).toBe('error');
+    expect(missing[0].message).toContain('.claude/skills/');
   });
 
-  test('no warning for a skill under <cwd>/.claude/skills/', async () => {
+  test('Claude accepts a skill under <cwd>/.claude/skills/', async () => {
     await stageSkill(tmpDir, '.claude', 'my-skill');
     const issues = await validateWorkflowResources(skillsWorkflow('my-skill'), tmpDir);
-    expect(missingSkillWarnings(issues)).toHaveLength(0);
+    expect(missingSkillIssues(issues)).toHaveLength(0);
   });
 
-  test('no warning for a skill under ~/.agents/skills/', async () => {
+  test('Claude rejects a skill installed only under ~/.agents/skills/', async () => {
     await stageSkill(fakeHome, '.agents', 'home-skill');
     const issues = await validateWorkflowResources(skillsWorkflow('home-skill'), tmpDir);
-    expect(missingSkillWarnings(issues)).toHaveLength(0);
+    const missing = missingSkillIssues(issues);
+    expect(missing).toHaveLength(1);
+    expect(missing[0].level).toBe('error');
   });
 
-  test('no warning for a skill under ~/.claude/skills/', async () => {
+  test('Claude accepts a skill under ~/.claude/skills/', async () => {
     await stageSkill(fakeHome, '.claude', 'home-skill');
     const issues = await validateWorkflowResources(skillsWorkflow('home-skill'), tmpDir);
-    expect(missingSkillWarnings(issues)).toHaveLength(0);
+    expect(missingSkillIssues(issues)).toHaveLength(0);
   });
 
-  test('warning when the skill exists in none of the search roots', async () => {
+  test('Claude accepts a user skill from the configured CLAUDE_CONFIG_DIR', async () => {
+    const configDir = join(fakeHome, 'custom-claude-config');
+    const skillDir = join(configDir, 'skills', 'custom-user-skill');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'SKILL.md'), '# custom user skill\n');
+
+    const issues = await validateWorkflowResources(skillsWorkflow('custom-user-skill'), tmpDir, {
+      claudeConfigDir: configDir,
+    });
+
+    expect(missingSkillIssues(issues)).toHaveLength(0);
+  });
+
+  test('Claude rejects a HOME skill when configured CLAUDE_CONFIG_DIR replaces user scope', async () => {
+    await stageSkill(fakeHome, '.claude', 'home-only');
+    const configDir = join(fakeHome, 'empty-custom-claude-config');
+
+    const issues = await validateWorkflowResources(skillsWorkflow('home-only'), tmpDir, {
+      claudeConfigDir: configDir,
+    });
+
+    expect(missingSkillIssues(issues)).toHaveLength(1);
+  });
+
+  test('Claude warns, not errors, when the skill is on no root at all', async () => {
+    // A name absent from every filesystem root may still be one of Claude's
+    // built-in skills or a `plugin:skill` entry — neither lives under a skills
+    // directory. Erroring here would make those undeclarable (PR #2535 review).
     const issues = await validateWorkflowResources(skillsWorkflow('nonexistent-skill'), tmpDir);
-    const warnings = missingSkillWarnings(issues);
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0].nodeId).toBe('step1');
-    expect(warnings[0].message).toContain("Skill 'nonexistent-skill' not found");
-    expect(warnings[0].message).toContain('.agents/skills/');
-    expect(warnings[0].hint).toContain('.agents/skills/nonexistent-skill/SKILL.md');
+    const missing = missingSkillIssues(issues);
+    expect(missing).toHaveLength(1);
+    expect(missing[0].level).toBe('warning');
+    expect(missing[0].nodeId).toBe('step1');
+    expect(missing[0].message).toContain("Claude skill 'nonexistent-skill' not found");
+    expect(missing[0].message).toContain('built-in');
+    expect(missing[0].hint).toContain('.claude/skills/nonexistent-skill/SKILL.md');
   });
 
-  test('skill directory without SKILL.md still warns', async () => {
+  test('Claude skill directory without SKILL.md still errors', async () => {
     // An empty directory is not a valid skill — the resolver requires SKILL.md.
-    await mkdir(join(tmpDir, '.agents', 'skills', 'empty-skill'), { recursive: true });
+    await mkdir(join(tmpDir, '.claude', 'skills', 'empty-skill'), { recursive: true });
     const issues = await validateWorkflowResources(skillsWorkflow('empty-skill'), tmpDir);
-    expect(missingSkillWarnings(issues)).toHaveLength(1);
+    const missing = missingSkillIssues(issues);
+    expect(missing).toHaveLength(1);
+    expect(missing[0].level).toBe('error');
+  });
+
+  test('Pi keeps accepting the shared .agents skill root', async () => {
+    await stageSkill(tmpDir, '.agents', 'portable-skill');
+    const workflow = makeWorkflow(
+      'test',
+      [{ id: 'step1', prompt: 'do work', skills: ['portable-skill'] } as unknown as DagNode],
+      'pi'
+    );
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(missingSkillIssues(issues)).toHaveLength(0);
+  });
+
+  test('Codex warns about unsupported YAML skills without four-root validation', async () => {
+    await stageSkill(tmpDir, '.claude', 'claude-only');
+    const workflow = makeWorkflow(
+      'test',
+      [{ id: 'step1', prompt: 'do work', skills: ['claude-only'] } as unknown as DagNode],
+      'codex'
+    );
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(missingSkillIssues(issues)).toHaveLength(0);
+    const warning = issues.find(issue => issue.level === 'warning' && issue.field === 'skills');
+    expect(warning?.message).toContain("not supported by provider 'codex'");
+    expect(warning?.hint).toContain('$skill-name');
+  });
+
+  test('uses a node model alias provider for Claude skill validation', async () => {
+    const workflow = makeWorkflow(
+      'test',
+      [
+        {
+          id: 'step1',
+          prompt: 'do work',
+          model: '@claude-node',
+          skills: ['missing'],
+        } as unknown as DagNode,
+      ],
+      'codex'
+    );
+
+    const issues = await validateWorkflowResources(workflow, tmpDir, {
+      aliases: { '@claude-node': { provider: 'claude', model: 'sonnet' } },
+      assistant: 'codex',
+    });
+
+    const missing = missingSkillIssues(issues);
+    expect(missing).toHaveLength(1);
+    // Claude-specific wording proves the alias-resolved provider drove the
+    // check, rather than the workflow-level 'codex' default.
+    expect(missing[0].message).toContain('Claude skill');
+    expect(issues.some(issue => issue.message.includes("not supported by provider 'codex'"))).toBe(
+      false
+    );
+  });
+
+  test('uses a workflow model alias provider for inherited Codex skill warnings', async () => {
+    const workflow = {
+      ...skillsWorkflow('missing'),
+      model: '@codex-workflow',
+    } as WorkflowDefinition;
+
+    const issues = await validateWorkflowResources(workflow, tmpDir, {
+      aliases: { '@codex-workflow': { provider: 'codex', model: 'gpt-5.5' } },
+      assistant: 'claude',
+    });
+
+    expect(missingSkillIssues(issues)).toHaveLength(0);
+    expect(issues.some(issue => issue.message.includes("not supported by provider 'codex'"))).toBe(
+      true
+    );
+  });
+
+  test('Claude project-only settingSources rejects a user-only skill', async () => {
+    await stageSkill(fakeHome, '.claude', 'user-only');
+
+    const issues = await validateWorkflowResources(skillsWorkflow('user-only'), tmpDir, {
+      claudeSettingSources: ['project'],
+    });
+
+    expect(missingSkillIssues(issues)).toHaveLength(1);
+  });
+
+  test('Claude user-only node settingSources rejects a project-only skill', async () => {
+    await stageSkill(tmpDir, '.claude', 'project-only');
+    const workflow = makeWorkflow(
+      'test',
+      [
+        {
+          id: 'step1',
+          prompt: 'do work',
+          skills: ['project-only'],
+          settingSources: ['user'],
+        } as unknown as DagNode,
+      ],
+      'claude'
+    );
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+
+    expect(missingSkillIssues(issues)).toHaveLength(1);
+  });
+
+  test('Claude empty settingSources rejects every declared skill', async () => {
+    await stageSkill(tmpDir, '.claude', 'disabled');
+    const workflow = makeWorkflow(
+      'test',
+      [
+        {
+          id: 'step1',
+          prompt: 'do work',
+          skills: ['disabled'],
+          settingSources: [],
+        } as unknown as DagNode,
+      ],
+      'claude'
+    );
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+
+    expect(missingSkillIssues(issues)).toHaveLength(1);
   });
 });
